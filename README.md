@@ -274,18 +274,6 @@ slopes = analyzer.source_vs_recipient_slope_test(
     analyzer.wasserstein_temporal())
 ```
 
-## Key Design Decisions
-
-- **Sequential training** (n_lakes=None, graphs shuffled each epoch) is the primary paradigm. It creates a universal codebook where each gene maps to the same VQ code regardless of which co-expression network it appears in. This enables direct quantitative comparison of code usage histograms via Wasserstein distance.
-
-- **Joint training** (n_lakes=N) concatenates lake embeddings to node features and trains on all graphs simultaneously. It allows a gene to map to different codes in different lakes, potentially capturing lake-specific co-expression patterns at the cost of comparability.
-
-- **Multi-scale spectral reconstruction** builds co-expression graphs at multiple eigendecomposition levels (K={2,4,16,32}) and combines them into a single adjacency. This captures both coarse community structure and fine-grained connectivity.
-
-- **Codebook size of 100** was chosen via eigenvalue elbow analysis: ~64 components explain most variance, and 100 codes provide headroom above the largest stratum (121 fish).
-
-- **`commit_alpha=0.25`** is the default commitment loss weight. Increasing to 1.0 was tested and found to worsen codebook collapse (fewer active codes, Year signal dominating biological signals).
-
 ## Citation
 
 If you use SURGE in your research, please cite the accompanying manuscript.
