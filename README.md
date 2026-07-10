@@ -15,19 +15,19 @@ pip install -r requirements.txt
                    ┌──────────────────────────────────────────────┐
 Expression ───────►│  CoexpressionGraphBuilder                    │
 matrices           │  Spectral decomposition + multi-scale        │
-                   │  reconstruction → adjacency matrices          │
+                   │  reconstruction → adjacency matrices         │
                    └──────────────┬───────────────────────────────┘
                                   │ edge_index, radii
                    ┌──────────────▼───────────────────────────────┐
                    │  VQGNN                                       │
                    │  3× SAGEConv → VQ codebook (100 codes)       │
-                   │  → Sigmoid decoder → loss vs. ground truth    │
+                   │  → Sigmoid decoder → loss vs. ground truth   │
                    └──────────────┬───────────────────────────────┘
                                   │ codebook histograms (100-dim)
                    ┌──────────────▼───────────────────────────────┐
                    │  LakeAnalyzer                                │
                    │  PCA · Wasserstein · PERMANOVA · clustering  │
-                   │  Label permutation · Code enrichment          │
+                   │  Label permutation · Code enrichment         │
                    └──────────────────────────────────────────────┘
 ```
 
@@ -72,7 +72,7 @@ from surge import CoexpressionGraphBuilder
 
 builder = CoexpressionGraphBuilder(
     n_eigencomponents=64,                    # eigenvectors to retain
-    reconstruction_levels=[2, 4, 16, 32],    # multi-scale reconstruction
+    reconstruction_levels=[2, 4, 16, 32, 64], # multi-scale reconstruction
     target_density=0.05,                     # sparsification target
     k_graph=15,                              # k-NN for graph construction
 )
@@ -111,8 +111,14 @@ model = VQGNN(
     decoder_channels=64,     # sigmoid decoder hidden dim
     n_lakes=None,            # None = sequential (no lake conditioning)
     commit_alpha=0.25,       # commitment loss weight
+    noise_scale=5.0,         # multiplier for radii-based noise injection
+    lake_embed_dim=32,       # dimension of per-lake conditioning embedding
 )
 ```
+
+Training uses the Adam optimizer with learning rate \(\eta = 10^{-4}\) and weight decay \(\lambda = 10^{-4}\). Graph order is shuffled each epoch. All forward passes use `torch.bfloat16` mixed precision — bf16 has the same 8-bit exponent as float32, so no gradient scaling is needed.
+
+**Codebook details:** The VQ layer uses cosine similarity (L2-normalized vectors) rather than Euclidean distance for code assignment, preventing norm-dominated codes. The codebook operates in a lower-dimensional space (\(d_{\text{code}}=8\)) via a learned projection (projected VQ), even though the encoder output is 16-dimensional. Codebook vectors are initialized via 20 iterations of k-means on a batch of encoder outputs. During training, dead codes (EMA update count < 2) are revived by re-initializing to random encoder outputs. An orthogonal regularization loss (\(\lambda_{\text{orth}}=10\)) encourages code diversity. The EMA decay rate is 0.7 (lower than the typical 0.8–0.99) for faster adaptation.
 
 **Two training paradigms:**
 
@@ -147,8 +153,8 @@ from surge import LakeEmbedder
 embedder = LakeEmbedder(model, device="cuda")
 embedder.train(graphs_dict, radii_dict,
                save_path="output/model.pt",
-               epochs=20, lr=5e-4, joint=False,
-               commit_alpha=1.0, shuffle_graphs=True)
+               epochs=20, lr=1e-4, joint=False,
+               commit_alpha=0.25, shuffle_graphs=True)
 
 embeddings = embedder.embed_all(graphs_dict)
 # -> dict[str, np.ndarray]  (key -> 100-dim histogram)
@@ -256,7 +262,7 @@ matrices = data.build_all_matrices(by="year_lake")
 
 # 2. Build graphs
 builder = CoexpressionGraphBuilder(n_eigencomponents=64,
-                                    reconstruction_levels=[2, 4, 16, 32])
+                                    reconstruction_levels=[2, 4, 16, 32, 64])
 graphs = builder.build_all(matrices, output_dir="output/10k_genes/")
 
 # 3. Train model
@@ -274,6 +280,7 @@ slopes = analyzer.source_vs_recipient_slope_test(
     analyzer.wasserstein_temporal())
 ```
 
-## Citation
+## Computational Resources
 
-If you use SURGE in your research, please cite the accompanying manuscript.
+All experiments were conducted on a single NVIDIA A100 GPU (80 GB VRAM) with PyTorch 2.0.1 and PyTorch Geometric 2.3.1. Training the sequential and joint models (~381 graphs, 20 epochs) takes approximately 23 hours. The spectral reconstruction pipeline requires approximately 8 hours on an 8-core CPU. Training uses batched graph loading with background-thread prefetch to overlap CPU I/O with GPU computation, and bf16 mixed precision throughout.
+
