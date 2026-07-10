@@ -1,4 +1,4 @@
-# SURGE — Shared Unified Representation of Gene co-Expression
+# SURGE: Spectral Uncertainty‑aware Representation of Gene Co‑expression Networks across Time, Space, and Environment
 
 A framework for comparative co-expression network analysis using Vector-Quantized Graph Neural Networks (VQ-GNN). SURGE learns a shared discrete codebook across hundreds of co-expression networks and compares them quantitatively via Wasserstein distance on codebook histogram embeddings.
 
