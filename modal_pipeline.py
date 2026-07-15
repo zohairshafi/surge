@@ -44,7 +44,7 @@ volume = modal.Volume.from_name("rol_output", create_if_missing=True)
 
 # Paths inside the volume
 DATA_DIR   = "/vol"        # files at volume root, not in a subdir
-OUTPUT_DIR = "/vol/25k_genes_high_commit"
+OUTPUT_DIR = "/vol/25k"
 
 # ---------------------------------------------------------------------------
 # Concurrency guard: all entrypoints share OUTPUT_DIR, so two simultaneous
@@ -563,7 +563,7 @@ def train_steps(codebook_size: int = 100, top_n_genes: int = None,
             "--output-dir",    out_dir,
             "--epochs", str(epochs),
             "--lr", "1e-4",
-            "--commit-alpha", "1.0",
+            "--commit-alpha", "0.25",
             "--noise-scale", "5.0",
             "--codebook-size", str(codebook_size),
             "--label-permutations", "1000",

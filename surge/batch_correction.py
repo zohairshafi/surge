@@ -375,7 +375,7 @@ def batch_correct_hk(metadata_path, transcriptome_path,
     Returns
     -------
     dict with keys 'source_lakes', 'recipient_lakes', each mapping to
-    the dict returned by run_combat.
+    the dict returned by run_combat, and 'pipeline_csv'.
     """
     print("=" * 70)
     print("COMBAT BATCH CORRECTION — HK Transcriptome")
@@ -428,7 +428,20 @@ def batch_correct_hk(metadata_path, transcriptome_path,
     expr_cols = [c for c in merged.columns if c not in meta_cols]
     meta_aligned = merged[meta_cols].reset_index(drop=True)
     rna_hk = merged[expr_cols].reset_index(drop=True)
-    # Fill NaN with 0 — missing counts are treated as zero expression
+    # Drop fish with NO measured genes (entirely-NaN rows). These are fish
+    # that were never sequenced for HK — all of 2024, plus an unmeasured
+    # subset of every other year. Filling them with 0 and running ComBat
+    # fabricates expression values that pollute every stratum. Real fish
+    # are fully measured (no partial NaN), so this removes exactly the
+    # unmeasured fish and keeps all genuine data.
+    fully_nan = rna_hk.isna().all(axis=1)
+    if fully_nan.any():
+        print(f"  Dropping {int(fully_nan.sum())} fish with no measured "
+              f"genes (all-NaN rows, e.g. all of 2024)")
+        rna_hk = rna_hk.loc[~fully_nan.values].reset_index(drop=True)
+        meta_aligned = meta_aligned.loc[~fully_nan.values].reset_index(drop=True)
+    # Fill any remaining NaN with 0 (no-op once unmeasured fish are dropped,
+    # since real fish are fully measured; kept as a safety net).
     if rna_hk.isna().any().any():
         nan_count = rna_hk.isna().sum().sum()
         print(f"  Filling {nan_count} NaN values with 0")

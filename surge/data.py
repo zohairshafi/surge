@@ -261,7 +261,7 @@ class SticklebackData:
         return sorted(ids)
 
     def get_expression_matrix(self, lake=None, year=None, sex=None,
-                              infection=None, min_fish=1):
+                              infection=None, min_fish=15):
         """
         Return a row-normalized expression matrix M (n_fish × n_genes)
         for the fish matching the given filters.
