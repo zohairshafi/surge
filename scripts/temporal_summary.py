@@ -56,26 +56,62 @@ def main():
             continue
 
         emb = pickle.load(open(emb_path, "rb"))
-        analyzer = LakeAnalyzer(emb, data=MockData())
+        # Load the matching codebook (saved by the pipeline) so the
+        # Wasserstein OT uses the codebook cosine ground metric.
+        cb_path = os.path.join(args.output_dir,
+                               emb_file.replace('embeddings', 'codebook'))
+        codebook = (pickle.load(open(cb_path, "rb"))
+                    if os.path.exists(cb_path) else None)
+        analyzer = LakeAnalyzer(emb, data=MockData(), codebook=codebook)
 
         fig, axes = plt.subplots(1, 3, figsize=(14, 5))
 
         for ax, strat in zip(axes, strats):
             sub = analyzer.for_stratification(strat)
-            wass = sub.wasserstein_temporal(base_year=2019)
+            # wasserstein_temporal now raises for suffixed-only stratifications
+            # (sex/infection), whose per-lake temporal series is undefined when
+            # 'Lake (2021)-f' and 'Lake (2021)-m' collide per (lake, year).
+            # Previously these panels silently mixed / overwrote strata.
+            try:
+                wass = sub.wasserstein_temporal(base_year=2019)
+            except ValueError as exc:
+                print(f"  [temporal_summary] Stratification '{strat}' skipped: "
+                      f"{exc}")
+                ax.set_title(f"{strat}\n(skipped: no unambiguous per-lake "
+                             f"temporal series)", fontsize=9)
+                continue
             wass_scaled, p95 = LakeAnalyzer.scale_wasserstein_p95(wass)
 
             src_vals, rec_vals = [], []
             src_names, rec_names = [], []
+            unclassified = []
+            last_years = []
             for lake, dists in wass_scaled.items():
-                role = LAKE_ROLES.get(lake, "Other")
+                role = LAKE_ROLES.get(lake)
+                if role is None:
+                    # Loudly report lakes missing from the hardcoded 16-lake
+                    # map instead of silently dropping them from the plot.
+                    unclassified.append(lake)
+                    continue
                 endpoint = dists[-1][1]
+                last_years.append(dists[-1][0])
                 if role == "Source":
                     src_vals.append(endpoint)
                     src_names.append(lake)
                 elif role == "Recipient":
                     rec_vals.append(endpoint)
                     rec_names.append(lake)
+            if unclassified:
+                print(f"  [temporal_summary] {strat}: {len(unclassified)} "
+                      f"lake(s) not in the hardcoded role map and dropped: "
+                      f"{', '.join(sorted(unclassified))}")
+            if last_years:
+                distinct_last = sorted(set(last_years))
+                if len(distinct_last) > 1:
+                    print(f"  [temporal_summary] {strat}: WARNING — lakes were "
+                          f"last sampled in DIFFERENT years "
+                          f"({distinct_last}); endpoint divergence compares "
+                          f"lakes at unequal time horizons.")
 
             # Collect all labelled points, then place with de-conflicted offsets
             labelled = []  # (x, val, label, side)
@@ -147,7 +183,7 @@ def main():
         # Print stats
         for strat in strats:
             sub = analyzer.for_stratification(strat)
-            wass = sub.wasserstein_temporal(base_year=2019)
+            wass = sub.wasserstein_temporal_or_skip(base_year=2019)
             wass_scaled, _ = LakeAnalyzer.scale_wasserstein_p95(wass)
             sv, rv = [], []
             for lake, dists in wass_scaled.items():

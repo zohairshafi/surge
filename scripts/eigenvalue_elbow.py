@@ -96,6 +96,8 @@ def compute_spectrum(M, max_k=64):
     except Exception:
         vals, vecs = eigsh(adj + 1e-8 * np.eye(n_genes, dtype=np.float64),
                            k=k, which="LM", v0=v0)
+    del adj  # free the n_genes×n_genes dense matrix (~6.3 GB) before the
+    # per-k reconstruction loop; it is no longer needed.
     vals = np.real(vals)
     vecs = np.real(vecs)
     order = np.argsort(vals)[::-1]
@@ -125,8 +127,10 @@ def evaluate_levels(eigvals, eigvecs, total_variance, ks, n_genes,
         results["eigenvalue"].append(eval_at_k)
 
         # ---- Edge density (reconstruct, binarize) ----
-        V_k = eigvecs[:, :k]
-        S_k = np.diag(eigvals[:k])
+        # float32 halves the reconstruction memory (28k×28k float64 = 6.3 GB
+        # → 3.1 GB).  The threshold/binarization only needs the ordering.
+        V_k = eigvecs[:, :k].astype(np.float32)
+        S_k = np.diag(eigvals[:k].astype(np.float32))
         recon = V_k @ S_k @ V_k.T
         if np.iscomplexobj(recon):
             recon = recon.real

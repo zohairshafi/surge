@@ -39,8 +39,21 @@ class SticklebackData:
     fish_to_infection : dict Fish_ID -> int (fibrosis score 0-4)
     lake_to_genotype : dict str -> str (BenthicPool / LimneticPool / MixedPool)
     lake_classification : dict str -> dict with 'role' (Source/Recipient/Other)
-                           and 'ecotype' (Benthic/Limnetic)
+                           and 'ecotype' (Benthic/Limnetic) and, for recipient
+                           lakes where it can differ from ecotype, 'lake habitat'
+                           (Benthic/Limnetic).  Source lakes have no 'lake
+                           habitat' key — habitat == ecotype there.
     """
+
+    # Colour palette for the physical lake habitat.  Distinct from ecotype
+    # (ancestry): a recipient lake's habitat can differ from the ancestry of
+    # its transplanted fish (e.g. Fred/Ranchero: Limnetic ancestry, Benthic
+    # habitat).  Source lakes fall back to their ecotype as habitat.
+    HABITAT_COLORS = {
+        'Benthic':  '#8dd3c7',   # teal
+        'Limnetic': '#80b1d3',   # steel blue
+        'Unknown':  '#b3b3b3',
+    }
 
     # Manual classification of lakes into experimental roles.
     # Source = long-established populations (monitoring controls, should be stable).
@@ -56,14 +69,14 @@ class SticklebackData:
         'Wik':        {'role': 'Source',    'ecotype': 'Limnetic'},
         'Watson':     {'role': 'Source',    'ecotype': 'Benthic'},
         # Recipient lakes
-        'CC Lake':    {'role': 'Recipient', 'ecotype': 'Benthic'},
-        'Crystal':    {'role': 'Recipient', 'ecotype': 'Limnetic'},
-        'Fred':       {'role': 'Recipient', 'ecotype': 'Limnetic'},
-        'Hope':       {'role': 'Recipient', 'ecotype': 'Limnetic'},
-        'Leisure':    {'role': 'Recipient', 'ecotype': 'Limnetic'},
-        'Loon':       {'role': 'Recipient', 'ecotype': 'Limnetic+Benthic'},
-        'Leisure Pond':{'role': 'Recipient', 'ecotype': 'Benthic'},
-        'Ranchero':   {'role': 'Recipient', 'ecotype': 'Limnetic'},
+        'CC Lake':    {'role': 'Recipient', 'ecotype': 'Benthic', 'lake habitat': 'Benthic'},
+        'Crystal':    {'role': 'Recipient', 'ecotype': 'Limnetic', 'lake habitat': 'Limnetic'},
+        'Fred':       {'role': 'Recipient', 'ecotype': 'Limnetic', 'lake habitat': 'Benthic'},
+        'Hope':       {'role': 'Recipient', 'ecotype': 'Limnetic', 'lake habitat': 'Limnetic'},
+        'Leisure':    {'role': 'Recipient', 'ecotype': 'Benthic', 'lake habitat': 'Limnetic'},
+        'Loon':       {'role': 'Recipient', 'ecotype': 'Limnetic+Benthic', 'lake habitat': 'Benthic'},
+        'Leisure Pond':{'role': 'Recipient', 'ecotype': 'Benthic', 'lake habitat': 'Benthic'},
+        'Ranchero':   {'role': 'Recipient', 'ecotype': 'Limnetic', 'lake habitat': 'Benthic'},
         # Other
         'G Lake':     {'role': 'Other',     'ecotype': 'Limnetic+Benthic'},
         'Jean Lake':  {'role': 'Other',     'ecotype': 'Unknown'},
@@ -107,10 +120,29 @@ class SticklebackData:
         first_col = self.hk_data.columns[0]
         if first_col != 'Fish_ID':
             self.hk_data = self.hk_data.drop(columns=[first_col])
-        # Remove rows where every gene is NaN (original code checks gene
-        # columns only, not the Fish_ID column).
+        # A fish with ANY missing gene value would otherwise produce an
+        # all-NaN row after row-sum normalization (NaN propagates silently
+        # through the sum).  Drop those fish loudly rather than let the NaN
+        # poison the matrices.  Rows where every gene is NaN are also dropped.
         gene_cols = list(self.hk_data.columns[1:])
-        self.hk_data = self.hk_data.dropna(how='all', subset=gene_cols).reset_index(drop=True)
+        n_before = len(self.hk_data)
+        self.hk_data = self.hk_data.dropna(subset=gene_cols, how='any') \
+                                   .reset_index(drop=True)
+        n_dropped = n_before - len(self.hk_data)
+        if n_dropped > 0:
+            print(f"[data] Dropped {n_dropped} fish with ≥1 missing gene value "
+                  f"(would otherwise produce all-NaN normalized rows).")
+
+        # Duplicate Fish_IDs would silently inflate every matrix (pandas .loc
+        # returns ALL matching rows).  This is a data-integrity failure — fail
+        # loudly instead of silently double-counting fish.
+        dupes = self.hk_data['Fish_ID'].duplicated(keep=False)
+        dup_ids = sorted(self.hk_data.loc[dupes, 'Fish_ID'].astype(str).unique())
+        if dup_ids:
+            raise ValueError(
+                f"[data] Duplicate Fish_ID rows in transcriptome: {dup_ids}. "
+                f"Refusing to proceed — duplicates would silently inflate "
+                f"expression matrices.")
 
         self.gene_names = list(self.hk_data.columns[1:])
         self.n_genes = len(self.gene_names)
@@ -124,9 +156,25 @@ class SticklebackData:
                                      self.metadata['Lake']))
 
         # ------- Build lake_to_genotype map -------
-        lake_genotype = self.metadata[['Lake', 'GenotypePool']].drop_duplicates()
-        self.lake_to_genotype = dict(zip(lake_genotype['Lake'],
-                                         lake_genotype['GenotypePool']))
+        # A lake can genuinely contain fish from >1 genotype pool (the
+        # transplantation design).  Collapsing via drop_duplicates would
+        # silently pick one pool.  Instead: report mixed-genotype lakes loudly
+        # and label them 'MixedPool' (which has its own color), keeping the
+        # modal pool only as a fallback.
+        lake_geno = self.metadata[['Lake', 'GenotypePool']].dropna()
+        geno_by_lake = {lake: list(grp['GenotypePool'].unique())
+                        for lake, grp in lake_geno.groupby('Lake')}
+        self.lakes_with_mixed_genotype = {}
+        self.lake_to_genotype = {}
+        for lake, pools in geno_by_lake.items():
+            if len(pools) > 1:
+                self.lakes_with_mixed_genotype[str(lake)] = [str(p) for p in pools]
+                self.lake_to_genotype[lake] = 'MixedPool'
+            else:
+                self.lake_to_genotype[lake] = pools[0]
+        if self.lakes_with_mixed_genotype:
+            print(f"[data] Lakes with multiple genotype pools → labeled 'MixedPool': "
+                  f"{self.lakes_with_mixed_genotype}")
 
         # ------- Build year -> [fish_ids] map -------
         self.year_to_fish = {}
@@ -147,14 +195,28 @@ class SticklebackData:
                                     self.morphology['Sex_f_m_NA'])}
 
         # -- Load infection (fibrosis) ------------------------------------------
+        # Raw fibrosis scores are 0-4.  The analysis only stratifies into
+        # non-infected (0) vs infected (>=1); keeping the raw score would
+        # silently drop fish with scores 2-4 from BOTH strata.  Binarize at
+        # load: score >= 1 == infected.  Assumption stated explicitly: any
+        # nonzero fibrosis score counts as infected.
         self.fish_to_infection = {}
         self.infection = None
         if infection_path:
             self.infection = pd.read_csv(infection_path)
-            self.fish_to_infection = dict(
-                zip(self.infection['Fish_ID'],
-                    self.infection['Fibrosis_score_0_1_2_3_4'])
-            )
+            raw = dict(zip(self.infection['Fish_ID'],
+                           self.infection['Fibrosis_score_0_1_2_3_4']))
+            n_inf = 0
+            for f, score in raw.items():
+                s = int(score)
+                if s < 0:
+                    raise ValueError(f"[data] Negative fibrosis score {s} for "
+                                     f"fish {f}")
+                self.fish_to_infection[f] = 1 if s >= 1 else 0
+                n_inf += 1 if s >= 1 else 0
+            print(f"[data] Infection binarized: {n_inf} infected "
+                  f"(fibrosis >= 1), {len(raw) - n_inf} non-infected "
+                  f"(fibrosis == 0).")
 
     # ------------------------------------------------------------------
     # Classification helpers
@@ -181,9 +243,27 @@ class SticklebackData:
         return entry.get('role', 'Unknown') if entry else 'Unknown'
 
     def get_lake_ecotype(self, lake):
-        """Return 'Benthic' or 'Limnetic' for a lake."""
+        """Return 'Benthic' or 'Limnetic' for a lake (the ancestry/genotype
+        of the lake's fish)."""
         entry = self._normalize_lake(lake, self.LAKE_CLASSIFICATION)
         return entry.get('ecotype', 'Unknown') if entry else 'Unknown'
+
+    def get_lake_habitat(self, lake):
+        """Return the physical lake habitat for a lake: 'Benthic' or 'Limnetic'.
+
+        Recipient lakes may carry an explicit 'lake habitat' that differs from
+        the ecotype (ancestry) of their transplanted fish (e.g. Fred/Ranchero
+        are Limnetic-ancestry but Benthic-habitat).  Source lakes have no
+        'lake habitat' key because habitat == ecotype there, so this falls
+        back to ecotype.  Returns 'Unknown' for unclassified lakes.
+        """
+        entry = self._normalize_lake(lake, self.LAKE_CLASSIFICATION)
+        if entry:
+            habitat = entry.get('lake habitat')
+            if habitat:
+                return habitat
+            return entry.get('ecotype', 'Unknown')
+        return 'Unknown'
 
     def get_genotype(self, lake):
         """Return genotype pool string (BenthicPool / LimneticPool / MixedPool)."""
@@ -207,15 +287,20 @@ class SticklebackData:
             return 'source'
 
         genotype = self.get_genotype(lake)
-        eco = self.get_lake_ecotype(lake)
+        # Compare ancestry against the lake's PHYSICAL HABITAT, not its
+        # ecotype: the ecotype field is itself ancestry, so comparing
+        # genotype→ecotype measured ancestry-vs-ancestry and could never
+        # classify a lake as 'mismatched' (e.g. Fred/Ranchero are Limnetic-
+        # ancestry but Benthic-habitat).
+        hab = self.get_lake_habitat(lake)
 
         # Non-Source lakes without genotype data → 'other'
-        if genotype == 'nan' or eco == 'Unknown':
+        if genotype == 'nan' or hab == 'Unknown':
             return 'other'
 
-        # Mixed ancestry or mixed-ecotype habitat → 'mixed'
-        is_mixed_eco = ('Benthic' in eco and 'Limnetic' in eco)
-        if genotype == 'MixedPool' or is_mixed_eco:
+        # Mixed ancestry or mixed habitat → 'mixed'
+        is_mixed_hab = ('Benthic' in hab and 'Limnetic' in hab)
+        if genotype == 'MixedPool' or is_mixed_hab:
             return 'mixed'
 
         # Map genotype pool to expected ecotype for matched/mismatched
@@ -227,7 +312,7 @@ class SticklebackData:
         if genotype_eco is None:
             return 'other'
 
-        return 'matched' if genotype_eco == eco else 'mismatched'
+        return 'matched' if genotype_eco == hab else 'mismatched'
 
     def get_genotype_color(self, lake):
         """Return color for the lake's genotype pool."""
@@ -258,16 +343,18 @@ class SticklebackData:
             ids &= {f for f in ids
                     if self.fish_to_infection.get(f) == infection}
 
-        return sorted(ids)
+        return sorted(ids, key=lambda v: str(v))
 
     def get_expression_matrix(self, lake=None, year=None, sex=None,
-                              infection=None, min_fish=15):
+                              infection=None, min_fish=7):
         """
         Return a row-normalized expression matrix M (n_fish × n_genes)
         for the fish matching the given filters.
 
         Each row is divided by its sum so rows represent relative abundance
-        of gene expression across genes.
+        of gene expression across genes.  All-zero rows (failed samples)
+        are dropped loudly, and any residual NaN after normalization raises
+        instead of propagating silently.
 
         Returns None if fewer than `min_fish` fish match the criteria.
         """
@@ -286,8 +373,27 @@ class SticklebackData:
             np.clip(M, 0.0, None, out=M)
         # Row-wise normalization to relative abundance
         row_sums = M.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0] = 1.0
+        # All-zero rows are failed samples (no expression at all).  The old
+        # guard row_sums[row_sums == 0] = 1.0 silently turned them into
+        # uniform rows — fabricating data.  Drop them loudly instead.
+        bad_rows = (row_sums[:, 0] == 0) | (~np.isfinite(row_sums[:, 0]))
+        if bad_rows.any():
+            n_bad = int(bad_rows.sum())
+            dropped_ids = [str(f) for f, b in zip(fish, bad_rows) if b]
+            print(f"[data] Dropping {n_bad} fish with zero/non-finite total "
+                  f"expression: {dropped_ids[:5]}{' ...' if n_bad > 5 else ''}")
+            fish = [f for f, b in zip(fish, bad_rows) if not b]
+            M = M[~bad_rows]
+            row_sums = row_sums[~bad_rows]
+            # Re-check min_fish AFTER dropping failed samples.
+            if len(fish) < min_fish:
+                return None
         M = M / row_sums
+        if not np.isfinite(M).all():
+            raise ValueError(
+                f"[data] Non-finite values in normalized matrix after "
+                f"filtering lake={lake}, year={year}, sex={sex}, "
+                f"infection={infection}. Refusing to return a poisoned matrix.")
         return M
 
     # ------------------------------------------------------------------
@@ -319,15 +425,22 @@ class SticklebackData:
         """
         lakes = self._unique_lakes()
 
+        # NOTE (correctness fix): the optional year/sex/infection filters must
+        # apply in ADDITION to `by`, regardless of which dimension `by` varies
+        # over.  Previously each branch dropped the filters for the dimensions
+        # it did not iterate, so stratify(by='lake', infection=1) silently
+        # included non-infected fish.  Every branch now passes all filters.
         if by == 'lake':
             for lake in lakes:
-                M = self.get_expression_matrix(lake=lake)
+                M = self.get_expression_matrix(lake=lake, year=year,
+                                               sex=sex, infection=infection)
                 if M is not None:
                     yield lake, M
 
         elif by == 'year_lake':
             for yr, lake in product(self.years, lakes):
-                M = self.get_expression_matrix(lake=lake, year=yr)
+                M = self.get_expression_matrix(lake=lake, year=yr,
+                                               sex=sex, infection=infection)
                 if M is not None:
                     yield f'{lake} ({yr})', M
 
@@ -335,7 +448,9 @@ class SticklebackData:
             for sex_val, yr, lake in product(
                 ['f', 'm'], self.years, lakes
             ):
-                M = self.get_expression_matrix(lake=lake, year=yr, sex=sex_val)
+                M = self.get_expression_matrix(lake=lake, year=yr,
+                                               sex=sex_val,
+                                               infection=infection)
                 if M is not None:
                     yield f'{lake} ({yr})-{sex_val}', M
 
@@ -343,7 +458,8 @@ class SticklebackData:
             for inf, yr, lake in product(
                 [0, 1], self.years, lakes
             ):
-                M = self.get_expression_matrix(lake=lake, year=yr, infection=inf)
+                M = self.get_expression_matrix(lake=lake, year=yr, sex=sex,
+                                               infection=inf)
                 if M is not None:
                     yield f'{lake} ({yr})-{inf}', M
         else:

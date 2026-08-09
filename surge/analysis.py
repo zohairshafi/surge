@@ -70,6 +70,148 @@ def _attach_qvalues(results, pkey='p_value'):
     return results
 
 
+# ---------------------------------------------------------------------------
+# PERMANOVA helpers: multivariable marginal (Type-III) model, block-restricted
+# permutations, and betadisper. Pure numpy so the analysis needs no extra
+# stats dependency.
+# ---------------------------------------------------------------------------
+
+def _permute_within_blocks(labels, blocks, rng):
+    """Permute `labels` independently within each block value (restricted
+    permutation respecting repeated-measures nesting, e.g. years/sex/
+    infection within lake)."""
+    labels = np.asarray(labels)
+    blocks = np.asarray(blocks)
+    out = labels.copy()
+    for b in np.unique(blocks):
+        idx = np.where(blocks == b)[0]
+        if len(idx) > 1:
+            out[idx] = labels[rng.permutation(idx)]
+    return out
+
+
+def _factor_design_column(labels):
+    """Full (no-intercept) one-hot design matrix for a categorical factor.
+
+    PERMANOVA omits the intercept: the Gower matrix is already centered, so
+    the grand-mean direction lies in its null space. Returns (X, n_levels).
+    """
+    labels = np.asarray(labels)
+    uniq = sorted(set(labels.tolist()))
+    idx = {lab: i for i, lab in enumerate(uniq)}
+    X = np.zeros((len(labels), len(uniq)), dtype=np.float64)
+    for i, lab in enumerate(labels):
+        X[i, idx[lab]] = 1.0
+    return X, len(uniq)
+
+
+def _explained_ss(X, G):
+    """PERMANOVA explained sum-of-squares for design X on Gower matrix G:
+    trace(H G) = trace((X'X)^{-1} X' G X), H = X(X'X)^{-1} X'. Clamped to >= 0.
+    """
+    if X.shape[1] == 0:
+        return 0.0
+    try:
+        XtX_inv = np.linalg.pinv(X.T @ X)
+    except np.linalg.LinAlgError:
+        return 0.0
+    return max(float(np.trace(XtX_inv @ (X.T @ G @ X))), 0.0)
+
+
+def _oneway_F(z, groups):
+    """One-way ANOVA F-statistic of values `z` grouped by `groups`, or None
+    if undefined (<2 groups, non-positive within-SS, or no residual df)."""
+    groups = np.asarray(groups)
+    uniq = sorted(set(groups.tolist()))
+    if len(uniq) < 2:
+        return None
+    grand = z.mean()
+    ss_b = ss_w = 0.0
+    for g in uniq:
+        zi = z[groups == g]
+        ss_b += len(zi) * (zi.mean() - grand) ** 2
+        ss_w += float(((zi - zi.mean()) ** 2).sum())
+    df_b = len(uniq) - 1
+    df_w = len(z) - len(uniq)
+    if df_w <= 0 or ss_w <= 0:
+        return None
+    return float((ss_b / df_b) / (ss_w / df_w))
+
+
+def _betadisper(D, groups, n_perm, rng):
+    """Anderson PERMDISP2: distance-to-centroid in PCoA space, one-way ANOVA
+    F + permutation p. Lets centroid (location) effects be distinguished from
+    dispersion effects. Returns (F, p), or (None, None) if undefined."""
+    groups = np.asarray(groups)
+    uniq = sorted(set(groups.tolist()))
+    if len(uniq) < 2:
+        return None, None
+    n = D.shape[0]
+    J = np.eye(n) - np.ones((n, n)) / n
+    G = -0.5 * J @ (D ** 2) @ J
+    w, V = np.linalg.eigh(G)
+    pos = w > 0
+    coords = (V[:, pos] * np.sqrt(w[pos])[None, :]
+              if pos.any() else np.zeros((n, 1)))
+    z = np.zeros(n, dtype=np.float64)
+    for g in uniq:
+        idx = np.where(groups == g)[0]
+        if len(idx) == 0:
+            continue
+        z[idx] = np.linalg.norm(coords[idx] - coords[idx].mean(axis=0), axis=1)
+    F_obs = _oneway_F(z, groups)
+    if F_obs is None:
+        return None, None
+    null = []
+    for _ in range(n_perm):
+        Fp = _oneway_F(z, rng.permutation(groups))
+        if Fp is not None:
+            null.append(Fp)
+    p = (float((np.sum(np.array(null) >= F_obs) + 1) / (len(null) + 1))
+         if null else 1.0)
+    return float(F_obs), p
+
+
+_EMD_A_EQ_CACHE = {}
+
+
+def _emd_constraint_matrix(n):
+    """Sparse equality-constraint matrix for the n×n transport LP (row sums = a,
+    col sums = b). Depends only on n, so cache it."""
+    if n in _EMD_A_EQ_CACHE:
+        return _EMD_A_EQ_CACHE[n]
+    from scipy.sparse import vstack, csr_matrix
+    # Row constraints: for each i, sum_j P[i,j] = a[i].  P is flattened row-major.
+    rows, cols, vals = [], [], []
+    for i in range(n):
+        for j in range(n):
+            rows.append(i); cols.append(i * n + j); vals.append(1.0)
+    row_block = csr_matrix((vals, (rows, cols)), shape=(n, n * n))
+    # Column constraints: for each j, sum_i P[i,j] = b[j].
+    rows, cols, vals = [], [], []
+    for j in range(n):
+        for i in range(n):
+            rows.append(j); cols.append(i * n + j); vals.append(1.0)
+    col_block = csr_matrix((vals, (rows, cols)), shape=(n, n * n))
+    A_eq = vstack([row_block, col_block]).tocsr()
+    _EMD_A_EQ_CACHE[n] = A_eq
+    return A_eq
+
+
+def _emd_exact(a, b, C):
+    """Exact earth-mover's distance between distributions a, b over cost matrix
+    C, via the transportation LP (scipy HiGHS). No epsilon / no numerical
+    underflow — preferred over Sinkhorn for codebook costs in [0, 2]."""
+    from scipy.optimize import linprog
+    n = len(a)
+    A_eq = _emd_constraint_matrix(n)
+    res = linprog(C.ravel(), A_eq=A_eq, b_eq=np.concatenate([a, b]),
+                  bounds=[(0, None)] * (n * n), method='highs')
+    if not res.success:
+        return float(np.nan)
+    return float(res.fun)
+
+
 class LakeAnalyzer:
     """
     Downstream analysis of lake VQ-code histogram embeddings.
@@ -82,10 +224,47 @@ class LakeAnalyzer:
         Reference to the data loader for lake classification lookups.
     """
 
-    def __init__(self, embeddings, data=None):
+    def __init__(self, embeddings, data=None, codebook=None):
         self.embeddings = embeddings
         self.keys = sorted(embeddings.keys())
         self.data = data
+        # Codebook vectors [K, dim] for the Wasserstein ground metric (cosine
+        # distance between codes). Optional; when absent, wasserstein_temporal
+        # falls back to a 1-D Wasserstein on histogram values (legacy).
+        self.codebook = None
+        self._cost_matrix = None
+        if codebook is not None:
+            self.codebook = np.asarray(codebook, dtype=np.float32)
+            self._cost_matrix = self._cosine_cost_matrix(self.codebook)
+
+    @staticmethod
+    def _cosine_cost_matrix(codebook):
+        """K×K cosine-distance matrix between codebook vectors, used as the
+        optimal-transport ground cost for comparing VQ-code distributions."""
+        cb = np.asarray(codebook, dtype=np.float64)
+        norms = np.linalg.norm(cb, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        unit = cb / norms
+        sim = unit @ unit.T  # cosine similarity
+        return 1.0 - sim      # cosine distance ∈ [0, 2]
+
+    def _wasserstein_code_distance(self, a, b):
+        """Distance between two VQ-code histograms.
+
+        With a codebook: the exact earth-mover's (optimal-transport) distance
+        over the cosine ground cost between codebook vectors. Code indices are
+        categorical, so the transport cost must come from codebook geometry,
+        not index order. Without a codebook: falls back to the legacy 1-D
+        Wasserstein on histogram values (informative only)."""
+        a = np.asarray(a, dtype=np.float64).ravel()
+        b = np.asarray(b, dtype=np.float64).ravel()
+        if self._cost_matrix is not None:
+            sa, sb = a.sum(), b.sum()
+            if sa <= 0 or sb <= 0:
+                return 0.0
+            wa, wb = a / sa, b / sb  # normalized distributions
+            return _emd_exact(wa, wb, self._cost_matrix)
+        return float(wasserstein_distance(a, b))
 
     # ------------------------------------------------------------------
     # Stratification helpers
@@ -122,12 +301,12 @@ class LakeAnalyzer:
         """
         filtered = {k: self.embeddings[k] for k in self.keys
                     if self.stratification_from_key(k) == strat_type}
-        return LakeAnalyzer(filtered, data=self.data)
+        return LakeAnalyzer(filtered, data=self.data, codebook=self.codebook)
 
     def for_subset(self, keys):
         """Return a new LakeAnalyzer containing only the given keys."""
         filtered = {k: self.embeddings[k] for k in keys if k in self.embeddings}
-        return LakeAnalyzer(filtered, data=self.data)
+        return LakeAnalyzer(filtered, data=self.data, codebook=self.codebook)
 
     def for_role(self, role):
         """Return a new LakeAnalyzer with only Source or Recipient lake keys.
@@ -193,16 +372,38 @@ class LakeAnalyzer:
             Sorted by year.
         """
         lake_years = defaultdict(dict)
+        n_skipped_suffixed = 0
         for key, hist in self.embeddings.items():
             if ' (' not in key:
                 continue
             lake, rest = key.split(' (', 1)
-            year_str = rest.split(')')[0].split('-')[0]
+            if ')' not in rest:
+                continue
+            year_part, _, suffix = rest.partition(')')
+            # Only year_lake stratifications (e.g. 'Lake (2021)') belong in a
+            # per-lake temporal series.  sex/infection-suffixed keys
+            # ('Lake (2021)-f', 'Lake (2021)-0') share the same (lake, year)
+            # and would silently OVERWRITE each other in the dict, so they
+            # are skipped loudly instead.
+            if suffix.strip():
+                n_skipped_suffixed += 1
+                continue
             try:
-                year = int(float(year_str))
+                year = int(float(year_part))
             except ValueError:
                 continue
             lake_years[lake][year] = hist
+
+        if not lake_years and self.embeddings:
+            raise ValueError(
+                "[wasserstein_temporal] No year_lake embeddings found — the "
+                "analyzer holds only suffixed (sex/infection) stratifications. "
+                "Call for_stratification('year_lake') or build embeddings with "
+                "by='year_lake'.")
+        if n_skipped_suffixed:
+            print(f"[wasserstein_temporal] Skipped {n_skipped_suffixed} "
+                  f"non-year_lake keys (sex/infection-suffixed); temporal "
+                  f"series uses only year_lake embeddings.")
 
         result = {}
         for lake, year_hists in lake_years.items():
@@ -211,13 +412,27 @@ class LakeAnalyzer:
             else:
                 base_yr = min(year_hists)
             base_hist = year_hists[base_yr]
-            dists = [(yr, wasserstein_distance(base_hist, hist))
+            dists = [(yr, self._wasserstein_code_distance(base_hist, hist))
                      for yr, hist in sorted(year_hists.items())
                      if yr != base_yr]
             if dists:
                 result[lake] = dists
 
         return result
+
+    def wasserstein_temporal_or_skip(self, base_year=2019):
+        """Like ``wasserstein_temporal`` but returns ``{}`` with a loud note
+        instead of raising when this analyzer's keys don't define an
+        unambiguous per-lake temporal series (e.g. a sex/infection-suffixed
+        sub-analyzer, where 'Lake (2021)-f' and 'Lake (2021)-m' collide per
+        lake-year).  Per-stratification figure loops use this so a
+        legitimately-undefined stratification is skipped loudly rather than
+        crashing the pipeline."""
+        try:
+            return self.wasserstein_temporal(base_year=base_year)
+        except ValueError as exc:
+            print(f"  [wasserstein_temporal] Skipped: {exc}")
+            return {}
 
     # ------------------------------------------------------------------
     # Silhouette scores
@@ -374,15 +589,23 @@ class LakeAnalyzer:
             Mean change in Wasserstein distance per year.
         """
         slopes = {}
+        skipped = []
         for lake, year_dists in wasserstein_distances.items():
             if len(year_dists) < 2:
-                slopes[lake] = 0.0
+                # A <2-point lake has no estimable slope.  Fabricating 0.0
+                # polluted the Source/Recipient drift comparison with fake
+                # zeros — exclude it loudly instead.
+                skipped.append(lake)
                 continue
             years = np.array([y for y, _ in year_dists])
             dists = np.array([d for _, d in year_dists])
             A = np.vstack([years, np.ones_like(years)]).T
             slope, _ = np.linalg.lstsq(A, dists, rcond=None)[0]
             slopes[lake] = float(slope)
+        if skipped:
+            print(f"[compute_temporal_slopes] Excluded {len(skipped)} lake(s) "
+                  f"with <2 timepoints (no estimable slope): "
+                  f"{', '.join(sorted(skipped))}")
         return slopes
 
     def source_vs_recipient_slope_test(self, wasserstein_distances):
@@ -502,91 +725,82 @@ class LakeAnalyzer:
             n = len(keys)
             info = {'size': n, 'all_keys': keys, 'keys': keys[:5]}
 
+            # --- Lake-level enrichment (Role × Ecotype, Role, Ecotype).
+            # The background must be UNIQUE biological lakes: self.keys holds
+            # every stratification of the same lake (year_lake + sex_year_lake
+            # + infection_year_lake), so counting keys double-counted each
+            # lake up to 3× and inflated the Fisher tables.
+            cluster_lakes = sorted(
+                {k.split(' (')[0] if ' (' in k else k for k in keys})
+            all_lakes = sorted(
+                {k.split(' (')[0] if ' (' in k else k for k in self.keys})
+            n_lakes = len(cluster_lakes)
+            n_bg = len(all_lakes)
+
             # --- Role × Ecotype (Source Benthic, Source Limnetic,
             #     Recipient Benthic, Recipient Limnetic) ---
             if self.data:
-                combos = []
-                for k in keys:
-                    lake = k.split(' (')[0] if ' (' in k else k
-                    role = self.data.get_lake_role(lake)
-                    eco = self.data.get_lake_ecotype(lake)
-                    combos.append(f'{role} {eco}')
-                combo_counts = Counter(combos)
+                combo_counts = Counter(
+                    f'{self.data.get_lake_role(l)} '
+                    f'{self.data.get_lake_ecotype(l)}' for l in cluster_lakes)
                 info['role_ecotype_counts'] = dict(combo_counts)
-                # Background
-                all_combos = []
-                for k in self.keys:
-                    lake = k.split(' (')[0] if ' (' in k else k
-                    role = self.data.get_lake_role(lake)
-                    eco = self.data.get_lake_ecotype(lake)
-                    all_combos.append(f'{role} {eco}')
-                bg_combos = Counter(all_combos)
+                bg_combos = Counter(
+                    f'{self.data.get_lake_role(l)} '
+                    f'{self.data.get_lake_ecotype(l)}' for l in all_lakes)
                 info['role_ecotype_enrichment'] = {}
                 for combo in ['Source Benthic', 'Source Limnetic',
                               'Recipient Benthic', 'Recipient Limnetic']:
                     in_cluster = combo_counts.get(combo, 0)
+                    if in_cluster == 0:
+                        continue
                     in_other = bg_combos.get(combo, 0) - in_cluster
-                    not_in_cluster = n - in_cluster
-                    not_in_other = len(self.keys) - n - in_other
-                    if in_cluster > 0 and in_other > 0:
-                        _, p = fisher_exact([[in_cluster, not_in_cluster],
-                                             [in_other, not_in_other]])
-                        info['role_ecotype_enrichment'][combo] = {
-                            'count': in_cluster, 'pct': in_cluster / n,
-                            'fisher_p': float(p),
-                        }
+                    # NOTE: no `in_other > 0` guard — the fully-contained
+                    # case (in_other == 0) is the STRONGEST enrichment and
+                    # must be reported, not skipped.
+                    _, p = fisher_exact([[in_cluster, n_lakes - in_cluster],
+                                         [in_other, n_bg - n_lakes - in_other]])
+                    info['role_ecotype_enrichment'][combo] = {
+                        'count': in_cluster, 'pct': in_cluster / n_lakes,
+                        'fisher_p': float(p),
+                    }
 
                 # --- Marginal role (Source / Recipient) ---
-                roles = []
-                for k in keys:
-                    lake = k.split(' (')[0] if ' (' in k else k
-                    roles.append(self.data.get_lake_role(lake))
-                role_counts = Counter(roles)
+                role_counts = Counter(
+                    self.data.get_lake_role(l) for l in cluster_lakes)
                 info['role_counts'] = dict(role_counts)
-                all_roles_bg = []
-                for k in self.keys:
-                    lake = k.split(' (')[0] if ' (' in k else k
-                    all_roles_bg.append(self.data.get_lake_role(lake))
-                bg_roles = Counter(all_roles_bg)
+                bg_roles = Counter(
+                    self.data.get_lake_role(l) for l in all_lakes)
                 info['role_enrichment'] = {}
                 for role in ['Source', 'Recipient']:
                     in_cluster = role_counts.get(role, 0)
+                    if in_cluster == 0:
+                        continue
                     in_other = bg_roles.get(role, 0) - in_cluster
-                    not_in_cluster = n - in_cluster
-                    not_in_other = len(self.keys) - n - in_other
-                    if in_cluster > 0 and in_other > 0:
-                        _, p = fisher_exact([[in_cluster, not_in_cluster],
-                                             [in_other, not_in_other]])
-                        info['role_enrichment'][role] = {
-                            'count': in_cluster, 'pct': in_cluster / n,
-                            'fisher_p': float(p),
-                        }
+                    _, p = fisher_exact([[in_cluster, n_lakes - in_cluster],
+                                         [in_other, n_bg - n_lakes - in_other]])
+                    info['role_enrichment'][role] = {
+                        'count': in_cluster, 'pct': in_cluster / n_lakes,
+                        'fisher_p': float(p),
+                    }
 
                 # --- Marginal ecotype (Benthic / Limnetic) ---
-                ecotypes = []
-                for k in keys:
-                    lake = k.split(' (')[0] if ' (' in k else k
-                    ecotypes.append(self.data.get_lake_ecotype(lake))
-                eco_counts = Counter(ecotypes)
+                eco_counts = Counter(
+                    self.data.get_lake_ecotype(l) for l in cluster_lakes)
                 info['ecotype_counts'] = dict(eco_counts)
-                all_eco_bg = []
-                for k in self.keys:
-                    lake = k.split(' (')[0] if ' (' in k else k
-                    all_eco_bg.append(self.data.get_lake_ecotype(lake))
-                bg_eco = Counter(all_eco_bg)
+                bg_eco = Counter(
+                    self.data.get_lake_ecotype(l) for l in all_lakes)
                 info['ecotype_enrichment'] = {}
                 for eco in ['Benthic', 'Limnetic']:
                     in_cluster = eco_counts.get(eco, 0)
+                    if in_cluster == 0:
+                        continue
                     in_other = bg_eco.get(eco, 0) - in_cluster
-                    not_in_cluster = n - in_cluster
-                    not_in_other = len(self.keys) - n - in_other
-                    if in_cluster > 0 and in_other > 0:
-                        _, p = fisher_exact([[in_cluster, not_in_cluster],
-                                             [in_other, not_in_other]])
-                        info['ecotype_enrichment'][eco] = {
-                            'count': in_cluster, 'pct': in_cluster / n,
-                            'fisher_p': float(p),
-                        }
+                    _, p = fisher_exact([[in_cluster, n_lakes - in_cluster],
+                                         [in_other, n_bg - n_lakes - in_other]])
+                    info['ecotype_enrichment'][eco] = {
+                        'count': in_cluster, 'pct': in_cluster / n_lakes,
+                        'fisher_p': float(p),
+                    }
 
                 # --- Sex (Male / Female) — only when keys carry sex suffixes ---
                 sexes = []
@@ -648,6 +862,21 @@ class LakeAnalyzer:
                                 'count': in_cluster, 'pct': in_cluster / n,
                                 'fisher_p': float(p),
                             }
+
+                # --- BH-FDR across every Fisher test in this cluster.  Dozens
+                #     of tests with no correction would produce spurious
+                #     'significant' enrichments. ---
+                fisher_families = ('role_ecotype_enrichment', 'role_enrichment',
+                                   'ecotype_enrichment', 'sex_enrichment',
+                                   'infection_enrichment')
+                all_fisher = []
+                for enr_key in fisher_families:
+                    for label, d in info.get(enr_key, {}).items():
+                        all_fisher.append((enr_key, label, d['fisher_p']))
+                if all_fisher:
+                    qvals = benjamini_hochberg([x[2] for x in all_fisher])
+                    for (enr_key, label, _), q in zip(all_fisher, qvals):
+                        info[enr_key][label]['fisher_q'] = float(q)
 
             # --- Year distribution ---
             years = []
@@ -739,13 +968,19 @@ class LakeAnalyzer:
             # Fold change (add small epsilon to avoid div by zero)
             fc = (inf_mean + 1e-8) / (ninf_mean + 1e-8)
 
-            # Mann-Whitney U test (non-parametric, handles zero-inflated data)
-            try:
-                from scipy.stats import mannwhitneyu
-                u_stat, p = mannwhitneyu(inf_usage, ninf_usage,
-                                         alternative='two-sided')
-            except Exception:
-                p = 1.0
+            # Mann-Whitney U test (non-parametric, handles zero-inflated data).
+            # No blanket try/except → p=1.0: a genuine failure (shape mismatch,
+            # etc.) must propagate loudly.  The only legitimate skip is when
+            # ALL values are identical across both groups, which makes
+            # Mann-Whitney undefined (scipy raises) and carries no signal.
+            pooled = np.concatenate([inf_usage, ninf_usage])
+            if np.all(pooled == pooled[0]):
+                print(f"  [infection_code_enrichment] code {code}: identical "
+                      f"usage across all strata — skipping.")
+                continue
+            from scipy.stats import mannwhitneyu
+            u_stat, p = mannwhitneyu(inf_usage, ninf_usage,
+                                     alternative='two-sided')
 
             results[code] = {
                 'infected_mean': inf_mean,
@@ -792,11 +1027,14 @@ class LakeAnalyzer:
             m_mean = float(np.mean(m_usage))
             f_mean = float(np.mean(f_usage))
             fc = (m_mean + 1e-8) / (f_mean + 1e-8)
-            try:
-                from scipy.stats import mannwhitneyu
-                _, p = mannwhitneyu(m_usage, f_usage, alternative='two-sided')
-            except Exception:
-                p = 1.0
+            # No blanket try/except → p=1.0 (see infection_code_enrichment).
+            pooled = np.concatenate([m_usage, f_usage])
+            if np.all(pooled == pooled[0]):
+                print(f"  [sex_code_enrichment] code {code}: identical usage "
+                      f"across all strata — skipping.")
+                continue
+            from scipy.stats import mannwhitneyu
+            _, p = mannwhitneyu(m_usage, f_usage, alternative='two-sided')
             results[code] = {
                 'male_mean': m_mean, 'female_mean': f_mean,
                 'fold_change': fc, 'p_value': float(p),
@@ -819,11 +1057,10 @@ class LakeAnalyzer:
     def _get_lake_role(self, key):
         """Resolve lake role from data object or hardcoded fallback."""
         lake = str(key).split(' (')[0] if ' (' in str(key) else str(key)
+        # No try/except here: a bug in data.get_lake_role must propagate, not
+        # be silently swallowed into the hardcoded fallback.
         if self.data is not None:
-            try:
-                return self.data.get_lake_role(lake)
-            except Exception:
-                pass
+            return self.data.get_lake_role(lake)
         return self._LAKE_ROLES.get(lake, 'Other')
 
     def role_code_enrichment(self, codebook_size=100):
@@ -860,11 +1097,14 @@ class LakeAnalyzer:
             s_mean = float(np.mean(s_usage))
             r_mean = float(np.mean(r_usage))
             fc = (s_mean + 1e-8) / (r_mean + 1e-8)
-            try:
-                from scipy.stats import mannwhitneyu
-                _, p = mannwhitneyu(s_usage, r_usage, alternative='two-sided')
-            except Exception:
-                p = 1.0
+            # No blanket try/except → p=1.0 (see infection_code_enrichment).
+            pooled = np.concatenate([s_usage, r_usage])
+            if np.all(pooled == pooled[0]):
+                print(f"  [role_code_enrichment] code {code}: identical usage "
+                      f"across all strata — skipping.")
+                continue
+            from scipy.stats import mannwhitneyu
+            _, p = mannwhitneyu(s_usage, r_usage, alternative='two-sided')
             results[code] = {
                 'source_mean': s_mean, 'recipient_mean': r_mean,
                 'fold_change': fc, 'p_value': float(p),
@@ -876,6 +1116,41 @@ class LakeAnalyzer:
     # Permutation tests
     # ------------------------------------------------------------------
 
+    def _permute_labels_lake_level(self, true_labels, rng, n_permutations):
+        """Permutation null of the silhouette score, permuting labels at the
+        LAKE level (block permutation).
+
+        ``self.keys`` holds multiple stratifications of each lake (year_lake +
+        sex_year_lake + infection_year_lake), so permuting keys directly would
+        treat every lake-year as an independent sample — pseudo-replication
+        that inflates the effective sample size.  Instead each lake is assigned
+        a label once per permutation and that label propagates to all of the
+        lake's keys, preserving within-lake correlation under the null.
+
+        Returns
+        -------
+        (null_scores : list[float], n_lakes : int)
+        """
+        labeled_keys = [k for k in self.keys if k in true_labels]
+        key_to_lake = {k: (k.split(' (')[0] if ' (' in k else k)
+                       for k in labeled_keys}
+        lakes = sorted({l for l in key_to_lake.values()})
+        lake_label = {}
+        for l in lakes:
+            first_key = next(k for k in labeled_keys if key_to_lake[k] == l)
+            lake_label[l] = true_labels[first_key]
+        lake_values = [lake_label[l] for l in lakes]
+
+        null_scores = []
+        for _ in range(n_permutations):
+            perm_vals = rng.permutation(lake_values)
+            perm_lake = dict(zip(lakes, perm_vals))
+            perm_labels = {k: perm_lake[key_to_lake[k]] for k in labeled_keys}
+            score = self.silhouette(perm_labels)
+            if not np.isnan(score):
+                null_scores.append(score)
+        return null_scores, len(lakes)
+
     def source_recipient_permutation_test(self, n_permutations=1000,
                                           random_seed=42):
         """
@@ -884,6 +1159,8 @@ class LakeAnalyzer:
 
         Shuffles Source/Recipient labels to build a null distribution.
         Does NOT require rebuilding graphs — only shuffles labels.
+        Labels are permuted at the LAKE level (block permutation) so multiple
+        stratifications of the same lake do not inflate the effective n.
 
         Parameters
         ----------
@@ -903,17 +1180,8 @@ class LakeAnalyzer:
         true_labels = self.build_labels('source_recipient')
         observed = self.silhouette(true_labels)
 
-        # Collect keys that have Source/Recipient labels
-        labeled_keys = [k for k in self.keys if k in true_labels]
-        label_values = [true_labels[k] for k in labeled_keys]
-
-        null_scores = []
-        for _ in tqdm(range(n_permutations)):
-            permuted_vals = rng.permutation(label_values)
-            perm_labels = dict(zip(labeled_keys, permuted_vals))
-            score = self.silhouette(perm_labels)
-            if not np.isnan(score):
-                null_scores.append(score)
+        null_scores, n_lakes = self._permute_labels_lake_level(
+            true_labels, rng, n_permutations)
 
         p_value = (np.sum(np.array(null_scores) >= observed) + 1) / (len(null_scores) + 1)
 
@@ -922,6 +1190,7 @@ class LakeAnalyzer:
             'null': null_scores,
             'p_value': p_value,
             'label_type': 'source_recipient',
+            'n_lakes': n_lakes,
         }
 
     def label_permutation_test(self, label_type, n_permutations=1000,
@@ -949,17 +1218,10 @@ class LakeAnalyzer:
         true_labels = self.build_labels(label_type)
         observed = self.silhouette(true_labels)
 
-        labeled_keys = [k for k in self.keys if k in true_labels]
-        label_values = [true_labels[k] for k in labeled_keys]
-
-        null_scores = []
-        for _ in tqdm(range(n_permutations),
-                      desc=f"  Permuting {label_type}"):
-            permuted_vals = rng.permutation(label_values)
-            perm_labels = dict(zip(labeled_keys, permuted_vals))
-            score = self.silhouette(perm_labels)
-            if not np.isnan(score):
-                null_scores.append(score)
+        # Lake-level block permutation (see _permute_labels_lake_level): do not
+        # treat every stratification of the same lake as an independent sample.
+        null_scores, n_lakes = self._permute_labels_lake_level(
+            true_labels, rng, n_permutations)
 
         if len(null_scores) > 0:
             p_value = ((np.sum(np.array(null_scores) >= observed) + 1)
@@ -972,35 +1234,52 @@ class LakeAnalyzer:
             'null': null_scores,
             'p_value': p_value,
             'label_type': label_type,
-            'n_labeled': len(labeled_keys),
+            'n_lakes': n_lakes,
         }
 
 
     def permanova_decomposition(self, metadata, n_permutations=1000,
-                                 random_seed=42):
+                                 random_seed=42, strata=None):
         """
-        Marginal PERMANOVA: for each categorical factor, compute the
-        fraction of variance in the VQ histogram distance matrix that
-        the factor alone explains (marginal R²), with a permutation-based
-        p-value.
+        Multivariable PERMANOVA with marginal (Type-III) R².
+
+        All factors are fit JOINTLY in one design; each factor's R² is its
+        PARTIAL variance — adjusted for all the other factors (the adonis2
+        ``by='margin'`` analog) — so confounded factors (Year/Lake/Ecotype/
+        Ancestry) share variance instead of each claiming it in full
+        (McArdle & Anderson 2001).
+
+        Permutations are restricted within ``strata`` blocks when provided
+        (e.g. lake, respecting the years/sex/infection-within-lake nesting);
+        unrestricted otherwise.
+
+        A betadisper (PERMDISP2; Anderson 2006) check is reported per factor
+        (``dispersion_F``, ``dispersion_p``) so centroid (location) effects
+        can be distinguished from dispersion effects.
+
+        Factors with any missing labels are dropped from that call
+        (complete-case analysis) and logged — e.g. Ancestry (recipient-only)
+        is assessed in the recipient-only call.
 
         Parameters
         ----------
         metadata : list[dict]
-            One dict per embedding, with keys like 'role', 'ecotype',
-            'year', 'sex', 'infection', 'lake'.
+            One dict per embedding (in self.keys order), with keys like
+            'Lake', 'Year', 'Ecotype', 'Lake Category', 'Ancestry', 'Sex'.
         n_permutations : int
         random_seed : int
+        strata : dict {key: block_label} or None
+            Block labels for restricted permutations (default: unrestricted).
 
         Returns
         -------
-        dict : {factor_name: {'r2': float, 'p_value': float, 'df': int}}
-            Sorted by R² descending.
+        dict {factor: {'r2','p_value','df','n_levels','q_value','f_stat',
+                       'dispersion_F','dispersion_p'}}, sorted by R² desc.
         """
         rng = np.random.default_rng(random_seed)
         X = np.vstack([self.embeddings[k] for k in self.keys])
         n = X.shape[0]
-        if n < 3:
+        if n < 3 or len(metadata) < n:
             return {}
 
         # Euclidean distance matrix + Gower centering
@@ -1011,101 +1290,118 @@ class LakeAnalyzer:
         if ss_total <= 0:
             return {}
 
-        # Include a factor if it appears in ANY sample. The per-factor
-        # valid_idx filter below drops rows that are missing/NaN for that
-        # factor. (Previously a factor missing from even one row — e.g.
-        #  Ancestry absent for source lakes — was dropped from the entire
-        #  decomposition, even though it was present for most rows.)
+        # Blocking labels for restricted permutations (None → unrestricted)
+        blocks = None
+        if strata is not None:
+            blocks = np.array([str(strata.get(k, k)) for k in self.keys])
+
+        # ---- Factor labels; drop factors with any missing values ----
         factor_names = list(metadata[0].keys())
-        for m in metadata[1:]:
+        for m in metadata[1:n]:
             for k in m.keys():
                 if k not in factor_names:
                     factor_names.append(k)
-        results = {}
+        factor_labels = {}
+        dropped = []
         for factor in factor_names:
-            raw_labels = [m.get(factor) for m in metadata]
-            # Drop NaN / None labels (can arise from missing metadata)
-            valid_idx = [i for i, v in enumerate(raw_labels)
-                         if v is not None
-                         and (not isinstance(v, float) or not np.isnan(v))]
-            if len(valid_idx) < 3:
+            raw = [metadata[i].get(factor) for i in range(n)]
+            if any(v is None or (isinstance(v, float) and np.isnan(v))
+                   for v in raw):
+                dropped.append(factor)
                 continue
-            labels = np.array([raw_labels[i] for i in valid_idx])
-            # Subset distance submatrix to valid rows
-            G_sub = G[np.ix_(valid_idx, valid_idx)]
-            ss_total_sub = float(np.trace(G_sub))
-            if ss_total_sub <= 0:
-                continue
-            unique = sorted(set(labels))
-            n_levels = len(unique)
-            if n_levels < 2:
-                continue
-            n_sub = len(valid_idx)
+            factor_labels[factor] = np.array([str(v) for v in raw])
+        modeled = list(factor_labels.keys())
+        if not modeled:
+            return {}
+        if dropped:
+            print(f"  [permanova] complete-case: dropped factors with missing "
+                  f"labels: {dropped}")
+
+        # ---- Full joint design + residual SS ----
+        X_full = np.hstack([_factor_design_column(factor_labels[f])[0]
+                            for f in modeled])
+        # Residual df must use the RANK of the design, not the nominal column
+        # count — nested/aliased factors (e.g. Ecotype within Lake) inflate the
+        # column count and would understate df_resid, biasing every F.
+        rank_full = np.linalg.matrix_rank(X_full)
+        df_resid = n - rank_full
+        if df_resid <= 0:
+            raise ValueError(
+                f"[permanova] Residual df = {df_resid} <= 0 (n={n} samples, "
+                f"design rank={rank_full}). The design is over-determined, so "
+                f"every factor would silently report F=0 / p=1. Reduce the "
+                f"factor set or use more samples.")
+        ss_full = _explained_ss(X_full, G)
+        ss_resid = ss_total - ss_full
+        if ss_resid <= 1e-12:
+            print(f"  [permanova] WARNING: residual SS ≈ 0 — the joint design "
+                  f"explains all variation; F statistics are degenerate.")
+
+        results = {}
+        for factor in modeled:
+            others = [f for f in modeled if f != factor]
+            X_red = (np.hstack([_factor_design_column(factor_labels[f])[0]
+                                for f in others]) if others
+                     else np.zeros((n, 0)))
+            ss_red = _explained_ss(X_red, G)
+            ss_factor = max(ss_full - ss_red, 0.0)   # marginal (partial) SS
+            n_levels = _factor_design_column(factor_labels[factor])[1]
             df_factor = n_levels - 1
-
-            # One-hot design matrix (valid rows only)
-            X_design = np.zeros((n_sub, n_levels))
-            for i, lab in enumerate(labels):
-                X_design[i, unique.index(lab)] = 1.0
-
-            # Hat matrix H = X (X'X)^-1 X'
-            XtX = X_design.T @ X_design
-            try:
-                XtX_inv = np.linalg.pinv(XtX)
-            except np.linalg.LinAlgError:
-                continue
-            H = X_design @ XtX_inv @ X_design.T
-            ss_factor = float(np.trace(H @ G_sub @ H))
-            r2 = ss_factor / ss_total_sub if ss_total_sub > 0 else 0.0
-
-            # Pseudo-F
-            ss_resid = ss_total_sub - ss_factor
-            df_resid = n_sub - n_levels
+            r2 = ss_factor / ss_total if ss_total > 0 else 0.0
             if df_resid > 0 and ss_resid > 0 and df_factor > 0:
                 f_obs = (ss_factor / df_factor) / (ss_resid / df_resid)
             else:
                 f_obs = 0.0
 
-            # Permutation null — restricted to the SAME valid subset as the
-            # observed statistic, so observed and permuted F are exchangeable.
-            # (Previously the null used the full n-row G + ss_total and wrote
-            #  the n_sub permuted labels into rows 0..n_sub-1 of an n-row
-            #  design, landing them in the wrong rows whenever any row was
-            #  dropped — making the permutation test invalid.)
+            # Permutation null for THIS factor's marginal effect: permute its
+            # labels (within strata blocks if given; else unrestricted), hold
+            # all other factors at their observed values, recompute marginal F.
             null_f = []
+            fcol = factor_labels[factor]
+            # If this factor does NOT vary within any block (e.g. Lake is the
+            # blocking variable), block-restricted permutation is degenerate
+            # (all permuted labels equal the observed ones → null ≡ observed
+            # → p = 1). Fall back to unrestricted — the factor IS the block,
+            # and its test compares against a global reallocation across blocks,
+            # matching adonis2 handling of the strata variable itself.
+            varies_within = False
+            if blocks is not None:
+                for b in np.unique(blocks):
+                    idx = np.where(blocks == b)[0]
+                    if len(np.unique(fcol[idx])) > 1:
+                        varies_within = True
+                        break
+            use_blocked = blocks is not None and varies_within
             for _ in range(n_permutations):
-                perm_labels = rng.permutation(labels)
-                X_perm = np.zeros((n_sub, n_levels))
-                for i, lab in enumerate(perm_labels):
-                    X_perm[i, unique.index(lab)] = 1.0
-                XtX_p = X_perm.T @ X_perm
-                try:
-                    XtX_p_inv = np.linalg.pinv(XtX_p)
-                except np.linalg.LinAlgError:
-                    continue
-                H_p = X_perm @ XtX_p_inv @ X_perm.T
-                ss_p = float(np.trace(H_p @ G_sub @ H_p))
-                ss_r = ss_total_sub - ss_p
-                if df_resid > 0 and ss_r > 0:
-                    null_f.append((ss_p / df_factor) / (ss_r / df_resid))
+                perm = (_permute_within_blocks(fcol, blocks, rng)
+                        if use_blocked else rng.permutation(fcol))
+                perm_col = _factor_design_column(perm)[0]
+                X_perm = (np.hstack([perm_col, X_red]) if X_red.shape[1]
+                          else perm_col)
+                ss_perm = _explained_ss(X_perm, G)
+                ss_f_perm = max(ss_perm - ss_red, 0.0)
+                if df_resid > 0 and ss_resid > 0 and df_factor > 0:
+                    null_f.append((ss_f_perm / df_factor)
+                                  / (ss_resid / df_resid))
+            p_value = ((np.sum(np.array(null_f) >= f_obs) + 1)
+                       / (len(null_f) + 1)) if null_f else 1.0
 
-            if null_f:
-                p_value = (np.sum(np.array(null_f) >= f_obs) + 1) / (len(null_f) + 1)
-            else:
-                p_value = 1.0
+            disp_F, disp_p = _betadisper(D, factor_labels[factor],
+                                         n_permutations, rng)
 
             results[factor] = {
                 'r2': r2,
                 'p_value': float(p_value),
                 'df': df_factor,
                 'n_levels': n_levels,
+                'f_stat': float(f_obs),
+                'dispersion_F': (float(disp_F) if disp_F is not None else None),
+                'dispersion_p': (float(disp_p) if disp_p is not None else None),
             }
 
-        # Multiple-testing correction: all factors tested in this
-        # decomposition form one family (BH-FDR q_value per factor).
+        # Multiple-testing correction: all factors in this decomposition form
+        # one family (BH-FDR q_value per factor).
         _attach_qvalues(results)
-
-        # Sort by R² descending
         return dict(sorted(results.items(), key=lambda x: -x[1]['r2']))
 
 
@@ -1375,24 +1671,42 @@ class GeneNetworkAnalyzer:
         for perm_gene_to_vq in permuted_gene_to_vq_list:
             keys = [stratification_key] if stratification_key else sorted(perm_gene_to_vq.keys())
 
-            # Build vq_to_gene for this permutation across all relevant keys
-            perm_vq_to_gene = defaultdict(list)
+            # Build per-key vq_to_gene for this permutation, so the neighbour
+            # lookup below is restricted to the SAME stratification (graph) as
+            # the target — matching co_occurrence_counts exactly.  NOT pooled
+            # across keys: pooling would let a gene co-occur with the target in
+            # graphs it was never present in (merely sharing a code somewhere),
+            # inflating the null and invalidating the empirical p-values.
+            perm_vq_to_gene = {}
             for key in keys:
+                per_key = defaultdict(list)
                 for g_idx, codes in perm_gene_to_vq.get(key, {}).items():
                     for c in codes:
-                        perm_vq_to_gene[c].append(g_idx)
+                        per_key[c].append(g_idx)
+                perm_vq_to_gene[key] = dict(per_key)
 
-            # Compute co-occurrence with target
+            # Compute co-occurrence with target, per key
             counts = Counter()
             for key in keys:
                 target_codes = perm_gene_to_vq.get(key, {}).get(gene_idx, [])
                 for code in target_codes:
-                    for neighbor in perm_vq_to_gene.get(code, []):
+                    for neighbor in perm_vq_to_gene.get(key, {}).get(code, []):
                         if neighbor != gene_idx:
                             counts[neighbor] += 1
 
             for neighbor, count in counts.items():
                 null_dist[neighbor].append(count)
+
+        # Pad permutations in which a neighbor was ABSENT (co-occurrence 0)
+        # so empirical_pvalues' denominator is the TRUE number of
+        # permutations, not just the count of permutations in which the
+        # neighbor happened to appear.  Without this, genes that co-occur
+        # only occasionally got artificially small denominators.
+        n_permutations = len(permuted_gene_to_vq_list)
+        for neighbor in list(null_dist.keys()):
+            missing = n_permutations - len(null_dist[neighbor])
+            if missing > 0:
+                null_dist[neighbor].extend([0] * missing)
 
         return dict(null_dist)
 

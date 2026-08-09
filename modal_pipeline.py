@@ -44,7 +44,7 @@ volume = modal.Volume.from_name("rol_output", create_if_missing=True)
 
 # Paths inside the volume
 DATA_DIR   = "/vol"        # files at volume root, not in a subdir
-OUTPUT_DIR = "/vol/25k"
+OUTPUT_DIR = "/vol/25k_v5"
 
 # ---------------------------------------------------------------------------
 # Concurrency guard: all entrypoints share OUTPUT_DIR, so two simultaneous
@@ -63,18 +63,32 @@ def _acquire_run_lock(run_id, stale_secs=_STALE_SECS):
     Call ``volume.reload()`` before this so the latest committed sentinel is
     visible. The cpu_steps and train_steps phases of ONE entrypoint pass the
     same run_id, so the normal serial flow never blocks itself.
+
+    ATOMICITY NOTE: Modal volume writes are local to each container until
+    ``volume.commit()``, so a pure check-then-write is NOT a cross-container
+    mutex — two containers can both pass the check and both commit.  This
+    function mitigates with (1) an atomic O_EXCL local create and (2) a
+    post-commit revalidation that aborts a run whose lock was overwritten by a
+    concurrent entrypoint.  This cannot be a perfect mutex on a shared volume;
+    the window is small but real.  Do NOT rely on it for truly concurrent runs.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     lock_path = os.path.join(OUTPUT_DIR, _RUN_LOCK)
-    if os.path.exists(lock_path):
+
+    def _read_lock():
         try:
             with open(lock_path) as fh:
-                info = json.load(fh)
+                return json.load(fh)
+        except FileNotFoundError:
+            return {}
         except Exception:
-            info = {}
-        other = info.get('run_id')
-        age = time.time() - info.get('started_at', 0)
-        if other != run_id and age < stale_secs:
+            return {}
+
+    info = _read_lock()
+    other = info.get('run_id')
+    age = time.time() - info.get('started_at', 0)
+    if other and other != run_id:
+        if age < stale_secs:
             raise RuntimeError(
                 f"Another RoL run (run_id={other}) is active in {OUTPUT_DIR} "
                 f"(started {age/3600:.1f}h ago). Concurrent entrypoints share "
@@ -82,12 +96,28 @@ def _acquire_run_lock(run_id, stale_secs=_STALE_SECS):
                 f"checkpoints. Wait for it to finish; or, if it crashed, "
                 f"remove {lock_path} and retry."
             )
-        if other != run_id:
-            print(f"[lock] Stale run lock (run_id={other}, "
-                  f"{age/3600:.1f}h old) — overwriting")
-    with open(lock_path, 'w') as fh:
+        print(f"[lock] Stale run lock (run_id={other}, "
+              f"{age/3600:.1f}h old) — overwriting")
+
+    try:
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    except FileExistsError:
+        # A local/committed lock appeared between our read and create.
+        raise RuntimeError(
+            f"[lock] Lost the lock for {OUTPUT_DIR} to a concurrent "
+            f"entrypoint during acquisition — aborting rather than clobbering.")
+    with os.fdopen(fd, 'w') as fh:
         json.dump({'run_id': run_id, 'started_at': time.time()}, fh)
     volume.commit()
+
+    # Post-commit revalidation: another container may have committed its own
+    # lock after our create.  If so, we are the loser — abort loudly.
+    volume.reload()
+    info2 = _read_lock()
+    if info2.get('run_id') != run_id:
+        raise RuntimeError(
+            f"[lock] Lost the lock to run_id={info2.get('run_id')} after "
+            f"commit — a concurrent entrypoint overwrote it. Aborting.")
 
 
 def _release_run_lock(run_id):
@@ -453,7 +483,8 @@ app = modal.App("rol-pipeline", image=image)
     memory=65536,        # 64 GB (graphs ~32 GB peak)
     cpu=8,
 )
-def cpu_steps(batch_n_genes: int = 10000, run_id: str = None):
+def cpu_steps(batch_n_genes: int = 10000, top_n_genes: int = None,
+              min_expression: float = 0.0, run_id: str = None):
     import os
     import sys
     import subprocess
@@ -486,6 +517,14 @@ def cpu_steps(batch_n_genes: int = 10000, run_id: str = None):
             "--stop-after", "2",
             # "--force",
         ]
+        # CRITICAL: forward the gene filter to the GRAPH-BUILD phase too.
+        # Previously only train_steps passed --top-n-genes/--min-expression,
+        # so graphs were built on ALL genes while the model was sized for
+        # top_n_genes → node-count mismatch at training time.
+        if top_n_genes is not None:
+            cmd.extend(["--top-n-genes", str(top_n_genes)])
+        if min_expression > 0:
+            cmd.extend(["--min-expression", str(min_expression)])
 
         print(f"[cpu_steps] Running: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
@@ -580,10 +619,15 @@ def train_steps(codebook_size: int = 100, top_n_genes: int = None,
             cmd.extend(["--graph-batch-size", str(graph_batch_size)])
         if resume:
             if not (train_both and graph_batch_size > 0):
-                print("[train] WARNING: --resume only applies to batched mode "
-                      "(train_both + graph_batch_size); ignoring resume flag.")
-            else:
-                cmd.append("--resume")
+                # Silently dropping --resume made `train_all --resume
+                # --epochs 30` train nothing extra and silently reuse the old
+                # checkpoint.  Fail loudly instead.
+                raise ValueError(
+                    "--resume requires --train-both AND --graph-batch-size > 0 "
+                    f"(got train_both={train_both}, "
+                    f"graph_batch_size={graph_batch_size}). Refusing to "
+                    "silently ignore the resume request.")
+            cmd.append("--resume")
         if start_epoch is not None:
             cmd.extend(["--start-epoch", str(start_epoch)])
 
@@ -701,12 +745,18 @@ def sequential_train(codebook_size: int = 100, top_n_genes: int = None,
     memory=65536,
     cpu=4,
 )
-def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5):
+def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5,
+               codebook_size: int = 100):
     """Comprehensive WGCNA: infection, sex, year comparisons with VQ overlap.
 
     Runs separate WGCNA per group, two-way module preservation, consensus
     module identification, eigengene → g:Profiler enrichment, and
     VQ-code vs WGCNA-module overlap analysis.
+
+    ``codebook_size`` must match the training run: train_steps redirects its
+    outputs to ``OUTPUT_DIR/codes_{N}`` when N != 100, so this function reads
+    the model outputs (mappings, figures) from the same redirected dir rather
+    than silently consuming stale root files.
     """
     import os, sys, subprocess
 
@@ -714,8 +764,13 @@ def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5):
     sys.path.insert(0, repo)
     os.chdir(repo)
 
+    # Mirror train_steps' out_dir resolution so downstream reads match where
+    # training wrote.  matrices.pkl stays in OUTPUT_DIR (the graph-build phase
+    # writes it there regardless of codebook_size).
+    out_dir = (OUTPUT_DIR if codebook_size == 100
+               else os.path.join(OUTPUT_DIR, f"codes_{codebook_size}"))
     matrices_path = os.path.join(OUTPUT_DIR, "matrices.pkl")
-    wgcna_dir = os.path.join(OUTPUT_DIR, "wgcna")
+    wgcna_dir = os.path.join(out_dir, "wgcna")
     script = os.path.join(repo, "scripts", "wgcna_pipeline.py")
 
     # Map paradigm to the correct gene_mappings file: sequential and joint
@@ -724,26 +779,28 @@ def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5):
     def _gm_for_figures(fig_dir):
         if fig_dir and 'joint' in os.path.basename(
             os.path.normpath(fig_dir).rstrip('/')):
-            return os.path.join(OUTPUT_DIR, "gene_mappings_joint.pkl")
-        return os.path.join(OUTPUT_DIR, "gene_mappings.pkl")
+            return os.path.join(out_dir, "gene_mappings_joint.pkl")
+        return os.path.join(out_dir, "gene_mappings.pkl")
 
     if not os.path.exists(matrices_path):
         print("ERROR: matrices.pkl not found — run cpu_steps first")
         return
-    # Require at least one gene_mappings file to exist
-    if not (os.path.exists(os.path.join(OUTPUT_DIR, "gene_mappings.pkl"))
-            or os.path.exists(os.path.join(OUTPUT_DIR, "gene_mappings_joint.pkl"))):
-        print("ERROR: no gene_mappings.pkl found — run steps 3-5 first")
+    # Require at least one gene_mappings file to exist (in the out_dir that
+    # matches the codebook_size the training used).
+    if not (os.path.exists(os.path.join(out_dir, "gene_mappings.pkl"))
+            or os.path.exists(os.path.join(out_dir, "gene_mappings_joint.pkl"))):
+        print(f"ERROR: no gene_mappings.pkl found in {out_dir} — run steps 3-5 "
+              f"first (with the matching --codebook-size)")
         return
 
     # VQ gene CSVs from pipeline step 9 (auto-detect joint vs sequential)
-    vq_figures = os.path.join(OUTPUT_DIR, 'figures_joint')
+    vq_figures = os.path.join(out_dir, 'figures_joint')
     vq_paradigm = 'joint'
     if not os.path.isdir(vq_figures):
-        vq_figures = os.path.join(OUTPUT_DIR, 'figures')
+        vq_figures = os.path.join(out_dir, 'figures')
         vq_paradigm = 'sequential'
-    alt_vq_figures = os.path.join(OUTPUT_DIR, 'figures') if vq_paradigm == 'joint' \
-                     else os.path.join(OUTPUT_DIR, 'figures_joint')
+    alt_vq_figures = os.path.join(out_dir, 'figures') if vq_paradigm == 'joint' \
+                     else os.path.join(out_dir, 'figures_joint')
     alt_paradigm = 'sequential' if vq_paradigm == 'joint' else 'joint'
     if not os.path.isdir(alt_vq_figures):
         alt_vq_figures = None
@@ -756,7 +813,7 @@ def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5):
         "--top-n-genes", str(top_n_genes),
         "--min-expression", str(min_expression),
         "--loc-tsv", os.path.join(DATA_DIR, "gene_name_to_locid.tsv"),
-        "--loc-cache", os.path.join(OUTPUT_DIR, "ncbi_loc_cache.json"),
+        "--loc-cache", os.path.join(out_dir, "ncbi_loc_cache.json"),
         "--vq-figures-dir", vq_figures,
     ]
     print(f"[wgcna_full] Running: {' '.join(cmd)}")
@@ -781,7 +838,7 @@ def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5):
                "--output", out_csv,
                "--p-threshold", "0.05",
                "--loc-tsv", os.path.join(DATA_DIR, "gene_name_to_locid.tsv"),
-               "--loc-cache", os.path.join(OUTPUT_DIR, "ncbi_loc_cache.json")]
+               "--loc-cache", os.path.join(out_dir, "ncbi_loc_cache.json")]
         print(f"[wgcna_full] {label}: {' '.join(cmd)}")
         try:
             subprocess.run(cmd, check=True)
@@ -802,14 +859,14 @@ def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5):
                                f"Role enrichment ({paradigm})")
 
     # --- Write enrichment summary to postprocess ------------------------
-    _write_enrichment_summary(wgcna_dir, os.path.join(OUTPUT_DIR, 'postprocess'))
+    _write_enrichment_summary(wgcna_dir, os.path.join(out_dir, 'postprocess'))
 
     # --- Refresh manuscript_stats.json so the VQ/WGCNA g:Profiler tables
     #     and intersections (items 5-7) are current.  The step-10 copy was
     #     written before this phase produced enrichment_summary.json.
     ms_script = os.path.join(repo, "scripts", "extract_manuscript_stats.py")
     if os.path.exists(ms_script):
-        ms_cmd = [sys.executable, "-u", ms_script, "--output-dir", OUTPUT_DIR]
+        ms_cmd = [sys.executable, "-u", ms_script, "--output-dir", out_dir]
         print(f"[wgcna_full] Refreshing manuscript_stats.json: {' '.join(ms_cmd)}")
         try:
             subprocess.run(ms_cmd, check=False)
@@ -887,10 +944,19 @@ def _regenerate_original_mappings_impl(train_joint: bool):
 
     embedder = LakeEmbedder(model, device="cpu")
 
-    # Regenerate gene mappings only (embeddings on Modal are still original)
+    # Regenerate gene mappings only (embeddings on Modal are still original).
+    # A joint model must be conditioned on its lake indices at eval time (the
+    # same mapping the training path builds), or build_gene_vq_mappings would
+    # raise for the joint model.
+    lake_name_to_id = None
+    if train_joint:
+        lake_names = sorted(
+            set(str(k).split(' (')[0] for k in graphs_manifest))
+        lake_name_to_id = {name: i for i, name in enumerate(lake_names)}
     print(f"[{label}] Building gene-VQ mappings from original model...")
     vq_to_gene, gene_to_vq = embedder.build_gene_vq_mappings(
-        _TqdmDict(graphs_manifest, f"[{label}] Gene mappings"))
+        _TqdmDict(graphs_manifest, f"[{label}] Gene mappings"),
+        lake_name_to_id=lake_name_to_id)
 
     # Get gene names from existing mappings (they don't change with retraining)
     existing_gm_path = os.path.join(OUTPUT_DIR, f"gene_mappings{sfx}.pkl")
@@ -939,12 +1005,16 @@ def run_original_mappings():
     """Upload original models and regenerate original mappings for both paradigms."""
     import subprocess, os
 
-    # Upload both models
+    # Upload both models.  IMPORTANT: `modal volume put` paths are relative to
+    # the volume root, and _regenerate_original_mappings_impl reads from
+    # OUTPUT_DIR = /vol/25k_v5.  The old targets ('output/...') landed the
+    # files at /vol/output/... — a different directory — so the regenerate step
+    # always hit FileNotFoundError.  Use the 25k_v5/ prefix to match.
     for local, remote in [
         ("output/model_joint.pt",
-         "output/model_joint_ORIGINAL.pt"),
+         "25k_v5/model_joint_ORIGINAL.pt"),
         ("output/model.pt",
-         "output/model_ORIGINAL.pt"),
+         "25k_v5/model_ORIGINAL.pt"),
     ]:
         print(f"Uploading {local} -> {remote}...")
         subprocess.run(
@@ -960,7 +1030,7 @@ def run_original_mappings():
     print("\n=== Regenerating SEQUENTIAL mappings ===")
     regenerate_original_mappings_sequential.remote()
 
-    print("\nDone. Pull with: modal volume get rol_output output/gene_mappings_ORIGINAL.pkl ...")
+    print("\nDone. Pull with: modal volume get rol_output 25k_v5/gene_mappings_ORIGINAL.pkl ...")
 
 
 @app.function(
@@ -1037,7 +1107,8 @@ def joint(codebook_size: int = 100, top_n_genes: int = None,
     """
     print("=== Phase 1: CPU (steps 0-2) ===")
     run_id = uuid.uuid4().hex[:8]
-    cpu_steps.remote(batch_n_genes, run_id=run_id)
+    cpu_steps.remote(batch_n_genes, top_n_genes, min_expression,
+                     run_id=run_id)
     print("=== Phase 2: GPU joint training (steps 3-10) ===")
     train_steps.remote(codebook_size, top_n_genes, min_expression,
                        train_joint=True, run_id=run_id)
@@ -1058,7 +1129,8 @@ def sequential(codebook_size: int = 100, top_n_genes: int = None,
     """
     print("=== Phase 1: CPU (steps 0-2) ===")
     run_id = uuid.uuid4().hex[:8]
-    cpu_steps.remote(batch_n_genes, run_id=run_id)
+    cpu_steps.remote(batch_n_genes, top_n_genes, min_expression,
+                     run_id=run_id)
     print("=== Phase 2: GPU sequential training (steps 3-10) ===")
     train_steps.remote(codebook_size, top_n_genes, min_expression,
                        train_joint=False, run_id=run_id)
@@ -1096,14 +1168,15 @@ def train_all(codebook_size: int = 100, top_n_genes: int = None,
         print("=== --resume: skipping CPU phase, continuing training ===")
     else:
         print("=== Phase 1: CPU (steps 0-2) ===")
-        cpu_steps.remote(batch_n_genes, run_id=run_id)
+        cpu_steps.remote(batch_n_genes, top_n_genes, min_expression,
+                         run_id=run_id)
     print("=== Phase 2: GPU train-both (steps 3-10 × 2 paradigms) ===")
     train_steps.remote(codebook_size, top_n_genes, min_expression,
                        train_both=True, graph_batch_size=graph_batch_size,
                        resume=resume, epochs=epochs, start_epoch=start_epoch,
                        run_id=run_id)
     print("=== Phase 3: WGCNA baseline ===")
-    wgcna_full.remote()
+    wgcna_full.remote(codebook_size=codebook_size)
     print("=== train_all complete ===")
 
 

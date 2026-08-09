@@ -152,8 +152,8 @@ class LakeEmbedder:
             and continue training on remaining keys.
         preloaded_seq : list or None
             Pre-loaded graph data: list of (key, edge_index, target_adj,
-            scaled_radii).  If provided, ``graphs_dict`` and ``radii_dict``
-            are ignored for loading.
+            scaled_radii, recon_weight).  If provided, ``graphs_dict`` and
+            ``radii_dict`` are ignored for loading.
         """
         keys = sorted(graphs_dict.keys())
         device = next(self.model.parameters()).device
@@ -173,29 +173,36 @@ class LakeEmbedder:
             graph_data = preloaded_seq
             print(f"[train] Using {len(graph_data)} pre-loaded graphs")
         else:
-            # Pre-load all valid graphs once
-            graph_data = []  # (key, edge_index, target_adj, scaled_radii)
+            # Pre-load all valid graphs once.  Each bundle holds one graph
+            # per reconstruction level (densities ramping 1% → 2% → …); we
+            # train on EVERY level and scale the reconstruction loss by
+            # 1/(i+1) for level i so the denser levels — whose MSE is
+            # naturally larger — do not dominate.
+            graph_data = []  # (key, edge_index, target_adj, scaled_radii, recon_weight)
             oom_set = set(skipped_oom)
             for key in tqdm(keys, desc="  Loading graphs", unit="graph"):
                 if key in oom_set:
                     continue
                 payload = self._load_graph_entry(graphs_dict[key])
                 graphs, bundled_radii = payload
-                if isinstance(graphs, (list, tuple)):
-                    g = graphs[0] if graphs else None
-                else:
-                    g = graphs
-                if g is None or (isinstance(g, dict) and g.get('degenerate')):
+                if not isinstance(graphs, (list, tuple)):
+                    graphs = [graphs]
+                if not graphs:
                     continue
-                if not hasattr(g, 'edge_index'):
+                if (isinstance(graphs[0], dict)
+                        and graphs[0].get('degenerate')):
                     continue
                 radii_arr = self._resolve_radii_for_key(
                     key=key, radii_dict=radii_dict,
-                    bundled_radii=bundled_radii, n_nodes=g.num_nodes,
+                    bundled_radii=bundled_radii,
+                    n_nodes=graphs[0].num_nodes,
                 )
                 scaled_radii = radii_arr * float(noise_scale)
-                graph_data.append((key, g.edge_index,
-                                   g.target_adj, scaled_radii))
+                for i, g in enumerate(graphs):
+                    if not hasattr(g, 'edge_index'):
+                        continue
+                    graph_data.append((key, g.edge_index, g.target_adj,
+                                       scaled_radii, 1.0 / (i + 1)))
 
         n_graphs = len(graph_data)
         print(f"[train] {n_graphs} valid graphs loaded, {epochs} epochs")
@@ -215,7 +222,8 @@ class LakeEmbedder:
             ep_edge_losses = []
             ep_commit_losses = []
             for g_idx in pbar:
-                key, edge_index, target_adj, radii_arr = graph_data[g_idx]
+                key, edge_index, target_adj, radii_arr, recon_weight = \
+                    graph_data[g_idx]
                 r = (torch.tensor(radii_arr, dtype=torch.float32, device=device)
                      if noise_scale != 0 else None)
                 try:
@@ -228,7 +236,9 @@ class LakeEmbedder:
                         target_adj,
                         batch_size=recon_batch_size,
                     )
-                    loss = edge_loss + commit_alpha * commit_loss
+                    # Scale the reconstruction term by 1/(i+1) for level i so
+                    # denser reconstruction levels don't dominate the loss.
+                    loss = recon_weight * edge_loss + commit_alpha * commit_loss
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -302,7 +312,7 @@ class LakeEmbedder:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def embed(self, graph):
+    def embed(self, graph, lake_idx=None):
         """
         Generate VQ code histogram embedding for a single graph.
 
@@ -310,6 +320,11 @@ class LakeEmbedder:
         ----------
         graph : Data
             Sparse graph (uses first reconstruction level if list).
+        lake_idx : int or None
+            Lake identity for conditioning.  REQUIRED for a jointly-trained
+            model (which shifts gene representations by a learned per-lake
+            vector before VQ discretization); passing None silently drops
+            that conditioning.  Only meaningful when the model has lake_emb.
 
         Returns
         -------
@@ -318,9 +333,28 @@ class LakeEmbedder:
         """
         self.model.eval()
         edge_index = graph.edge_index.to(self.device)
-        return self.model.get_codebook_histogram(edge_index).cpu().numpy()
+        return self.model.get_codebook_histogram(
+            edge_index, lake_idx=lake_idx).cpu().numpy()
 
-    def embed_all(self, graphs_dict):
+    def _resolve_lake_idx(self, key, lake_name_to_id):
+        """Resolve a lake index for a key, raising loudly if a joint model is
+        used without the mapping it needs (never silently drop conditioning)."""
+        if getattr(self.model, 'lake_emb', None) is None:
+            return None
+        if not lake_name_to_id:
+            raise ValueError(
+                "Joint-trained model (lake_emb present) requires a "
+                "lake_name_to_id mapping at embedding/mapping time; got None. "
+                "Without it the per-lake conditioning learned during training "
+                "would be silently dropped.")
+        lake = str(key).split(' (')[0]
+        idx = lake_name_to_id.get(lake)
+        if idx is None:
+            raise KeyError(f"Lake '{lake}' (from key '{key}') missing from "
+                           f"lake_name_to_id — cannot condition joint model.")
+        return idx
+
+    def embed_all(self, graphs_dict, lake_name_to_id=None):
         """
         Generate embeddings for all graphs.
 
@@ -328,6 +362,10 @@ class LakeEmbedder:
         ----------
         graphs_dict : dict {key: list[Data] or str}
             Multi-scale graphs per key, or bundle paths.
+        lake_name_to_id : dict {str: int} or None
+            Lake-name → index mapping used to condition a jointly-trained
+            model.  Required when the model has lake_emb (else a loud
+            ValueError is raised rather than silently dropping conditioning).
 
         Returns
         -------
@@ -344,7 +382,8 @@ class LakeEmbedder:
                 embeddings[key] = np.ones(codebook_size) / codebook_size
                 continue
             graph, _ = self._get_primary_graph(graph_entry)
-            embeddings[key] = self.embed(graph)
+            lake_idx = self._resolve_lake_idx(key, lake_name_to_id)
+            embeddings[key] = self.embed(graph, lake_idx=lake_idx)
         return embeddings
 
     # ------------------------------------------------------------------
@@ -352,18 +391,21 @@ class LakeEmbedder:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _get_assignments(self, graph):
+    def _get_assignments(self, graph, lake_idx=None):
         """Return (gene_index, vq_code) pairs for all genes in a graph."""
         edge_index = graph.edge_index.to(self.device)
-        indices = self.model.get_vq_assignments(edge_index).cpu().numpy()
+        indices = self.model.get_vq_assignments(
+            edge_index, lake_idx=lake_idx).cpu().numpy()
         return indices
 
-    def build_gene_vq_mappings(self, graphs_dict):
+    def build_gene_vq_mappings(self, graphs_dict, lake_name_to_id=None):
         """
         Build bidirectional gene ↔ VQ code lookup tables.
 
         For each stratification key, records which genes map to each
-        VQ code and which VQ codes each gene maps to.
+        VQ code and which VQ codes each gene maps to.  For a jointly-trained
+        model, ``lake_name_to_id`` is required so the per-lake conditioning
+        learned at training time is applied here too (never silently dropped).
 
         Returns
         -------
@@ -384,7 +426,8 @@ class LakeEmbedder:
                 gene_to_vq[key] = {}
                 continue
             graph, _ = self._get_primary_graph(graph_entry)
-            assign = self._get_assignments(graph)
+            lake_idx = self._resolve_lake_idx(key, lake_name_to_id)
+            assign = self._get_assignments(graph, lake_idx=lake_idx)
 
             vq_to_gene[key] = defaultdict(list)
             gene_to_vq[key] = defaultdict(list)

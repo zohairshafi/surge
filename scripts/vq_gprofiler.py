@@ -11,9 +11,9 @@ enrichment, recovering ~10% of otherwise-discarded genes.
 
 Usage:
   python scripts/vq_gprofiler.py \
-      --codes output/figures/infection_genes_for_go.csv \
-      --gene-mappings output/gene_mappings.pkl \
-      --output output/infection_vq_gprofiler.csv \
+      --codes rol/output/figures/infection_genes_for_go.csv \
+      --gene-mappings rol/output/gene_mappings.pkl \
+      --output rol/output/infection_vq_gprofiler.csv \
       --p-threshold 0.001
 """
 
@@ -193,8 +193,14 @@ def convert_to_ensembl(genes, organism="gaculeatus", delay=0.0):
 
 
 def run_enrichment(ensembl_ids, organism="gaculeatus",
-                   sources=None, user_threshold=0.05):
+                   sources=None, user_threshold=0.05, background=None):
     """Run g:Profiler enrichment and return significant terms.
+
+    background : list[str] or None
+        Ensembl IDs of the eligible gene universe (the pre-filtered set the
+        query was drawn from). When provided, domain_scope='custom' restricts
+        the statistical background to this universe instead of the whole
+        genome, giving correct p-values for queries from a filtered subset.
 
     Returns list of dicts with keys: source, term_id, term_name, p_value,
     intersection_size, term_size, precision, recall.
@@ -209,6 +215,9 @@ def run_enrichment(ensembl_ids, organism="gaculeatus",
         "user_threshold": user_threshold,
         "no_evidences": True,
     }
+    if background is not None:
+        payload["domain_scope"] = "custom"
+        payload["background"] = background
     resp = requests.post(GPROFILER_GOST_URL, json=payload, timeout=60)
     if resp.status_code != 200:
         return []
@@ -251,11 +260,15 @@ def main():
                         help="Comma-separated g:Profiler sources")
     parser.add_argument("--delay", type=float, default=0.3,
                         help="Delay in seconds between g:Profiler calls")
-    parser.add_argument("--loc-tsv", default="output/gene_name_to_locid.tsv",
+    parser.add_argument("--loc-tsv", default="rol/output/gene_name_to_locid.tsv",
                         help="Pre-computed gene name → LOC ID TSV")
-    parser.add_argument("--loc-cache", default="output/ncbi_loc_cache.json",
+    parser.add_argument("--loc-cache", default="rol/output/ncbi_loc_cache.json",
                         help="JSON cache file for NCBI LOC→name resolutions "
                              "(fallback, built automatically if TSV misses genes)")
+    parser.add_argument("--no-custom-background", action="store_true",
+                        help="Disable custom background (use g:Profiler "
+                             "genome-wide default instead of the filtered "
+                             "model gene set)")
     args = parser.parse_args()
 
     # Load gene names only (gene lists come from the CSV, not vq_to_gene)
@@ -274,6 +287,27 @@ def main():
         n_named = sum(1 for v in resolver._ncbi_cache.values() if v)
         print(f"Loaded NCBI cache: {len(resolver._ncbi_cache)} genes, "
               f"{n_named} with proper names")
+
+    # Custom background universe = all genes that entered the model (the
+    # filtered 10k/25k set), converted to Ensembl. Restricting the g:Profiler
+    # statistical domain to this universe (domain_scope='custom') instead of
+    # the whole genome gives correct enrichment p-values for queries drawn
+    # from a pre-filtered subset.
+    background_ensembl = None
+    if not args.no_custom_background:
+        bg_named = (resolver.resolve_many(gene_names, verbose=False)
+                    if resolver is not None else
+                    [g for g in gene_names
+                     if not g.upper().startswith('LOC')
+                     and not g.lower().startswith(('si.', 'si:', 'trna'))])
+        bg_named = [g for g in bg_named if g is not None]
+        background_ensembl = convert_to_ensembl(bg_named, args.organism)
+        if background_ensembl:
+            print(f"Custom background: {len(background_ensembl)} Ensembl IDs "
+                  f"(from {len(gene_names)} model genes)")
+        else:
+            print("  WARNING: background conversion failed — falling back to "
+                  "g:Profiler genome-wide default")
 
     # The gene_indices / gene_names columns can be very large (all genes
     # assigned to a VQ code, semicolon-separated), exceeding Python's
@@ -336,7 +370,8 @@ def main():
             continue
 
         # Step 4: enrich
-        terms = run_enrichment(ensembl_ids, args.organism, sources)
+        terms = run_enrichment(ensembl_ids, args.organism, sources,
+                               background=background_ensembl)
         time.sleep(args.delay)
 
         n_terms = len(terms)

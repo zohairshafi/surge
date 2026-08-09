@@ -1,0 +1,19 @@
+# Manuscript (not committed)
+manuscript.tex
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Claude Code session/config
+.claude/
+
+# OS
+.DS_Store
+
+# Pipeline outputs
+output/
+results*/

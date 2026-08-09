@@ -96,7 +96,7 @@ class VQGNN(nn.Module):
             kmeans_init=True,
             kmeans_iters=20,
             threshold_ema_dead_code=2,
-            orthogonal_reg_weight=10,
+            orthogonal_reg_weight=5,
             orthogonal_reg_active_codes_only=True,
             decay=0.7,
         )
@@ -153,7 +153,12 @@ class VQGNN(nn.Module):
         indices : torch.Tensor (n_nodes,)
             VQ code assignment for each gene.
         commit_loss : torch.Tensor (scalar)
-            Commitment loss encouraging encoder output to stay close to codebook.
+            Loss returned by the VectorQuantize layer.  NOTE: this is
+            ``commitment_loss + orthogonal_reg_weight * orthogonal_loss``
+            (orthogonal_reg_weight=5 here), NOT the bare commitment loss.
+            It is therefore larger than a raw commitment loss, and the
+            best-epoch criterion and logs that use it are inflated by the
+            orthogonal-regularization term.
         """
         x = self.node_emb.weight
         # nn.Embedding is excluded from AMP autocast per PyTorch policy, so the
@@ -165,7 +170,12 @@ class VQGNN(nn.Module):
 
         for conv in self.convs[:-1]:
             x = conv(x, edge_index)
-            if radii is not None:
+            # Radii noise is a TRAINING-ONLY data augmentation.  Gating on
+            # self.training makes eval-time forwards (get_vq_assignments /
+            # get_codebook_histogram) deterministic and consistent — without
+            # the guard, any eval call passing radii produced a different
+            # code assignment every run because of torch.randn_like.
+            if radii is not None and self.training:
                 radii_t = radii.to(device=x.device, dtype=x.dtype)
                 if radii_t.dim() == 1:
                     if radii_t.size(0) != x.size(0):
@@ -230,7 +240,16 @@ class VQGNN(nn.Module):
         Returns
         -------
         mse : torch.Tensor (scalar)
-            Mean squared error.
+            Mean squared error over OFF-DIAGONAL entries.
+
+        Notes
+        -----
+        The diagonal is masked out of the loss: the target diagonal is zeroed
+        (graphs.py zeroes ``np.fill_diagonal(binary_adj, False)``) but the
+        inner-product reconstruction's diagonal is ``sigmoid(||decoded_i||^2)
+        >= 0.5`` for every node, so those entries contribute an irreducible
+        >= 0.25 each and only push node norms toward zero, fighting positive
+        edge reconstruction.  Excluding them removes that systematic bias.
         """
         N = decoded.size(0)
         device = decoded.device
@@ -248,8 +267,13 @@ class VQGNN(nn.Module):
             tgt = target_adj[start:end].to(
                 device=device, dtype=torch.float32)         # (B, N) on GPU
 
-            losses.append((recon - tgt).pow(2).sum())
-            n_entries += recon.numel()
+            sq = (recon - tgt).pow(2)
+            # Mask the diagonal: row-local positions (j, start+j).
+            if end > start:
+                diag_pos = torch.arange(end - start, device=device)
+                sq[diag_pos, start + diag_pos] = 0.0
+            losses.append(sq.sum())
+            n_entries += sq.numel() - (end - start)
 
         return torch.stack(losses).sum() / n_entries
 
@@ -259,7 +283,8 @@ class VQGNN(nn.Module):
 
     def train_joint(self, model_save_path, list_of_edge_indices,
                     list_of_target_adjs, epochs=5, lr=1e-4,
-                    commit_alpha=0.25, radii=None, lake_ids=None):
+                    commit_alpha=0.25, radii=None, lake_ids=None,
+                    recon_weights=None):
         """
         Joint training with lake-identity conditioning.
 
@@ -303,6 +328,15 @@ class VQGNN(nn.Module):
             Integer ID for each graph (0..n_lakes-1).  If None, uses the
             graph index as the lake ID (one lake per graph).  Multiple graphs
             CAN share the same lake ID (e.g. different years of the same lake).
+        recon_weights : list[float] or None
+            Per-graph multiplier for the reconstruction (edge) loss term.
+            Used to balance multi-scale reconstruction levels: each bundle
+            contributes one graph per reconstruction level (densities ramping
+            1% → 2% → …), and level ``i`` (0-based) gets weight ``1/(i+1)`` so
+            the denser reconstructions — whose MSE is naturally larger — do
+            not dominate the loss.  When None, every graph has weight 1.0.
+            The VQ commitment loss is NOT scaled by this weight; it is the
+            same regularizer at every level.
         """
         if self.lake_emb is None:
             raise RuntimeError(
@@ -349,6 +383,14 @@ class VQGNN(nn.Module):
                 target_adj = list_of_target_adjs[g_idx]
                 lake_idx = lake_ids[g_idx]
 
+                # Multi-scale rebalancing: reconstruction level i (0-based)
+                # covers (i+1)% of edges, so its naturally larger MSE is
+                # divided by (i+1).  Only the edge term is scaled — the VQ
+                # commitment loss is level-invariant and stays unscaled.
+                w = 1.0
+                if recon_weights is not None:
+                    w = float(recon_weights[g_idx])
+
                 r = None
                 if radii is not None:
                     r = torch.tensor(radii[g_idx], dtype=torch.float32,
@@ -362,7 +404,7 @@ class VQGNN(nn.Module):
                         edge_index, radii=r, lake_idx=lake_idx,
                     )
                     edge_loss = self.reconstruction_loss(decoded, target_adj)
-                loss = edge_loss + commit_alpha * commit_loss
+                loss = w * edge_loss + commit_alpha * commit_loss
 
                 optimizer.zero_grad()
                 loss.backward()

@@ -104,7 +104,10 @@ class EnrichmentAnalyzer:
                     in_other = bg_combos.get(combo, 0) - in_cluster
                     not_in_cluster = n - in_cluster
                     not_in_other = len(self.keys) - n - in_other
-                    if in_cluster > 0 and in_other > 0:
+                    # No `in_other > 0` guard: the fully-contained case
+                    # (in_other == 0) is the STRONGEST enrichment and was
+                    # silently skipped before.
+                    if in_cluster > 0:
                         _, p = fisher_exact([[in_cluster, not_in_cluster],
                                              [in_other, not_in_other]])
                         info['role_ecotype'][combo] = {

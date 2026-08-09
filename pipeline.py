@@ -327,31 +327,46 @@ def step_build_graphs(args, cfg, matrices):
             # (important when --top-n-genes filtered the gene set)
             expected_n = cfg.get('n_genes')
             if expected_n:
-                sample_key = next(iter(cached_graphs.keys()))
-                sample_val = cached_graphs[sample_key]
-                # Resolve actual graph to get num_nodes
+                # Pick a NON-degenerate sample key: the first manifest key may
+                # be a degenerate bundle (a dict, no num_nodes), which would
+                # crash the node-count validation below.
                 import torch as _torch
-                if isinstance(sample_val, (str, os.PathLike)):
-                    g = _torch.load(os.fspath(sample_val), map_location='cpu',
-                                    weights_only=False)
-                    if isinstance(g, dict) and 'graphs' in g:
-                        g = g['graphs'][0]
-                    elif isinstance(g, (list, tuple)):
-                        g = g[0]
-                elif isinstance(sample_val, (list, tuple)):
-                    g = sample_val[0]
+                from surge.graphs import CoexpressionGraphBuilder as _CGB
+                sample_key = None
+                sample_val = None
+                for _k, _v in cached_graphs.items():
+                    if not _CGB.is_degenerate(_v):
+                        sample_key, sample_val = _k, _v
+                        break
+                if sample_val is not None:
+                    # Resolve actual graph to get num_nodes
+                    if isinstance(sample_val, (str, os.PathLike)):
+                        g = _torch.load(os.fspath(sample_val),
+                                        map_location='cpu',
+                                        weights_only=False)
+                        if isinstance(g, dict) and 'graphs' in g:
+                            g = g['graphs'][0]
+                        elif isinstance(g, (list, tuple)):
+                            g = g[0]
+                    elif isinstance(sample_val, (list, tuple)):
+                        g = sample_val[0]
+                    else:
+                        g = sample_val
+                    cached_n = (g.num_nodes if hasattr(g, 'num_nodes')
+                                else g.x.shape[0] if hasattr(g, 'x')
+                                else g.edge_index.max().item() + 1)
+                    if cached_n != expected_n:
+                        print(f"[Step 2] Cached graphs have {cached_n} nodes, "
+                              f"expected {expected_n} — rebuilding")
+                        args.force = True  # force rebuild for this step
+                        # fall through to rebuild below
+                    else:
+                        print("[Step 2] Loading cached graph manifest...")
+                        # _validate_graphs skipped — too slow (loads every .pt)
+                        return cached_graphs, load_pickle(radii_path)
                 else:
-                    g = sample_val
-                cached_n = (g.num_nodes if hasattr(g, 'num_nodes')
-                            else g.x.shape[0] if hasattr(g, 'x')
-                            else g.edge_index.max().item() + 1)
-                if cached_n != expected_n:
-                    print(f"[Step 2] Cached graphs have {cached_n} nodes, "
-                          f"expected {expected_n} — rebuilding")
-                    args.force = True  # force rebuild for this step
-                else:
-                    print("[Step 2] Loading cached graph manifest...")
-                    # _validate_graphs skipped — too slow (loads every .pt)
+                    print("[Step 2] Loading cached graph manifest "
+                          "(all keys degenerate — no node-count to validate)...")
                     return cached_graphs, load_pickle(radii_path)
             else:
                 print("[Step 2] Loading cached graph manifest...")
@@ -504,6 +519,7 @@ def _preload_all_graphs(graphs, radii, noise_scale, lake_name_to_id=None):
     list_of_target_adjs = []
     radii_list = []
     lake_ids_list = []
+    recon_weights_list = []
     seq_data = []  # for embedder.train()
     skipped_degenerate = []  # degenerate keys logged at end
 
@@ -511,6 +527,7 @@ def _preload_all_graphs(graphs, radii, noise_scale, lake_name_to_id=None):
     for key in tqdm(keys_sorted, desc="  Loading graphs", unit="graph"):
         graph_entry = graphs[key]
         bundled_r = None
+        graph_list = None
 
         if isinstance(graph_entry, (str, os.PathLike)):
             payload = torch.load(os.fspath(graph_entry), map_location='cpu',
@@ -527,18 +544,22 @@ def _preload_all_graphs(graphs, radii, noise_scale, lake_name_to_id=None):
                 raise KeyError(
                     f"Bundle for {key} missing 'graphs' key — "
                     f"not a degenerate sentinel (has {sorted(payload.keys())})")
-            graph = payload['graphs'][0]
+            graph_list = payload['graphs']
             bundled_r = payload.get('radii')
         elif isinstance(graph_entry, (list, tuple)):
-            graph = graph_entry[0]
+            graph_list = list(graph_entry)
         elif isinstance(graph_entry, dict) and graph_entry.get('degenerate'):
             skipped_degenerate.append(str(key))
             continue
         else:
-            graph = graph_entry
+            graph_list = [graph_entry]
 
-        # Resolve radii
-        r = _resolve_graph_radii(key, radii, bundled_r, graph.num_nodes)
+        if not graph_list:
+            continue
+
+        # Resolve radii once per key — radii are per-gene and shared across
+        # all reconstruction levels of the same graph.
+        r = _resolve_graph_radii(key, radii, bundled_r, graph_list[0].num_nodes)
         # ORIGINAL (uncomment if _resolve_graph_radii breaks):
         # r = radii.get(str(key))
         # if r is None and bundled_r is not None:
@@ -547,7 +568,7 @@ def _preload_all_graphs(graphs, radii, noise_scale, lake_name_to_id=None):
         #     else:
         #         r = bundled_r
         # if r is None:
-        #     r = np.ones(graph.num_nodes, dtype=np.float32)
+        #     r = np.ones(graph_list[0].num_nodes, dtype=np.float32)
         # elif isinstance(r, (str, os.PathLike)):
         #     r = np.load(os.fspath(r))
         # elif isinstance(r, torch.Tensor):
@@ -555,16 +576,22 @@ def _preload_all_graphs(graphs, radii, noise_scale, lake_name_to_id=None):
         # r = np.asarray(r, dtype=np.float32)
         scaled = r * float(noise_scale) if noise_scale != 0 else r.copy()
 
-        # Joint format
-        list_of_edge_indices.append(graph.edge_index)
-        list_of_target_adjs.append(graph.target_adj)
-        radii_list.append(r * float(noise_scale) if noise_scale != 0 else r.copy())
-        if lake_name_to_id is not None:
-            lake_name = str(key).split(' (')[0]
-            lake_ids_list.append(lake_name_to_id[lake_name])
+        # Train on EVERY reconstruction level (densities ramp 1% → 2% → …).
+        # Level i (0-based) covers (i+1)% of edges, so its reconstruction
+        # loss is divided by (i+1) to keep levels balanced.
+        lake_name = str(key).split(' (')[0]
+        for i, graph in enumerate(graph_list):
+            # Joint format
+            list_of_edge_indices.append(graph.edge_index)
+            list_of_target_adjs.append(graph.target_adj)
+            radii_list.append(r * float(noise_scale) if noise_scale != 0 else r.copy())
+            recon_weights_list.append(1.0 / (i + 1))
+            if lake_name_to_id is not None:
+                lake_ids_list.append(lake_name_to_id[lake_name])
 
-        # Sequential format
-        seq_data.append((key, graph.edge_index, graph.target_adj, scaled))
+            # Sequential format
+            seq_data.append((key, graph.edge_index, graph.target_adj,
+                             scaled, 1.0 / (i + 1)))
 
     if skipped_degenerate:
         print(f"  Skipped {len(skipped_degenerate)} degenerate graph(s): "
@@ -572,7 +599,7 @@ def _preload_all_graphs(graphs, radii, noise_scale, lake_name_to_id=None):
               f"{' ...' if len(skipped_degenerate) > 10 else ''}")
     return {
         'joint': (list_of_edge_indices, list_of_target_adjs,
-                  radii_list, lake_ids_list),
+                  radii_list, lake_ids_list, recon_weights_list),
         'sequential': seq_data,
         'n_loaded': len(list_of_edge_indices),
         'n_degenerate': len(skipped_degenerate),
@@ -770,6 +797,15 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
         if start_epoch >= args.epochs:
             print(f"[batched] Already completed {start_epoch} epochs "
                   f"(>= --epochs {args.epochs}); nothing to train.")
+            # The models currently hold the LAST training state (loaded from
+            # *_last.pt for resume), but model.pt / model_joint.pt hold the
+            # BEST epoch.  Downstream steps run on whatever we return, so load
+            # the best checkpoints here — otherwise a no-op resume would send
+            # last-epoch weights downstream that differ from model.pt on disk.
+            for m, path in ((seq_model, seq_path), (joint_model, joint_path)):
+                if exists(path):
+                    m.load_state_dict(torch.load(
+                        path, map_location=device, weights_only=True))
             return seq_model, joint_model
         print(f"[batched] Resuming: training epochs {start_epoch + 1}.."
               f"{args.epochs} (continuing from {start_epoch} completed)")
@@ -794,6 +830,7 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
         list_of_target_adjs = []
         radii_list_joint = []
         lake_ids_list = []
+        recon_weights_joint = []
         seq_data = []
         for g_idx in batch_indices:
             key = all_keys[g_idx]
@@ -810,10 +847,13 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
                 raise KeyError(
                     f"Bundle for {key} missing 'graphs' key — "
                     f"not a degenerate sentinel (has {sorted(payload.keys())})")
-            g = payload['graphs'][0]
+            graph_list = payload['graphs']
+            if not graph_list:
+                continue
             bundled_r = payload.get('radii')
 
-            r = _resolve_graph_radii(key, radii, bundled_r, g.num_nodes)
+            r = _resolve_graph_radii(key, radii, bundled_r,
+                                     graph_list[0].num_nodes)
             # ORIGINAL (uncomment if _resolve_graph_radii breaks):
             # r = radii.get(str(key))
             # if r is None and bundled_r is not None:
@@ -831,17 +871,24 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
             scaled = (r * float(args.noise_scale)
                       if args.noise_scale != 0 else r.copy())
 
-            list_of_edge_indices.append(g.edge_index)
-            list_of_target_adjs.append(g.target_adj)
-            radii_list_joint.append(
-                r * float(args.noise_scale) if args.noise_scale != 0 else r.copy())
-            if lake_name_to_id is not None:
-                lake_name = str(key).split(' (')[0]
-                lake_ids_list.append(lake_name_to_id[lake_name])
-            seq_data.append((g.edge_index, g.target_adj, scaled))
+            # Train on every reconstruction level; level i (0-based) gets
+            # reconstruction loss divided by (i+1) so denser levels don't
+            # dominate (their MSE is naturally larger).
+            lake_name = str(key).split(' (')[0]
+            for i, g in enumerate(graph_list):
+                list_of_edge_indices.append(g.edge_index)
+                list_of_target_adjs.append(g.target_adj)
+                radii_list_joint.append(
+                    r * float(args.noise_scale) if args.noise_scale != 0 else r.copy())
+                recon_weights_joint.append(1.0 / (i + 1))
+                if lake_name_to_id is not None:
+                    lake_ids_list.append(lake_name_to_id[lake_name])
+                seq_data.append((g.edge_index, g.target_adj, scaled,
+                                 1.0 / (i + 1)))
 
         return (list_of_edge_indices, list_of_target_adjs,
-                radii_list_joint, lake_ids_list, seq_data)
+                radii_list_joint, lake_ids_list, recon_weights_joint,
+                seq_data)
 
     prefetch = ThreadPoolExecutor(max_workers=1)
 
@@ -878,7 +925,8 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
         for bi in pbar:
             # Wait for this batch to finish loading
             (list_of_edge_indices, list_of_target_adjs,
-             radii_list_joint, lake_ids_list, seq_data) = pending.result()
+             radii_list_joint, lake_ids_list, recon_weights_joint,
+             seq_data) = pending.result()
 
             # Submit the next batch while GPU trains this one.
             # Within-epoch: next batch of the current permutation.
@@ -902,7 +950,7 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
             seq_model.train()
             batch_seq_edge = []
             batch_seq_commit = []
-            for edge_index, target_adj, scaled_radii in seq_data:
+            for edge_index, target_adj, scaled_radii, recon_weight in seq_data:
                 r_tensor = (
                     torch.tensor(scaled_radii, dtype=torch.float32,
                                  device=device)
@@ -916,7 +964,9 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
                         edge_index_gpu, radii=r_tensor)
                     edge_loss = seq_model.reconstruction_loss(
                         decoded, target_adj, batch_size=recon_batch_size)
-                loss = edge_loss + args.commit_alpha * commit_loss
+                # Multi-scale rebalancing: reconstruction level i (0-based)
+                # gets its naturally larger MSE divided by (i+1).
+                loss = recon_weight * edge_loss + args.commit_alpha * commit_loss
 
                 seq_opt.zero_grad()
                 loss.backward()
@@ -936,7 +986,11 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
                     lake_ids_list[i] if lake_ids_list else i)
 
                 r_tensor = None
-                if radii_list_joint:
+                # --noise-scale 0 must DISABLE joint noise too: without this
+                # check, the unscaled radii were still injected (the sequential
+                # path already guarded on noise_scale != 0, the joint path did
+                # not).
+                if radii_list_joint and args.noise_scale != 0:
                     r_tensor = torch.tensor(
                         radii_list_joint[i], dtype=torch.float32,
                         device=device)
@@ -948,7 +1002,10 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
                         edge_index_gpu, radii=r_tensor, lake_idx=lake_idx)
                     edge_loss = joint_model.reconstruction_loss(
                         decoded, target_adj, batch_size=recon_batch_size)
-                loss = edge_loss + args.commit_alpha * commit_loss
+                # Multi-scale rebalancing: reconstruction level i (0-based)
+                # gets its naturally larger MSE divided by (i+1).
+                loss = recon_weights_joint[i] * edge_loss + \
+                    args.commit_alpha * commit_loss
 
                 joint_opt.zero_grad()
                 loss.backward()
@@ -971,7 +1028,8 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
             # allocator reuse these blocks for the next batch. No
             # empty_cache() — it would force a sync + allocator thrash.
             del (list_of_edge_indices, list_of_target_adjs,
-                 radii_list_joint, lake_ids_list, seq_data)
+                 radii_list_joint, lake_ids_list, recon_weights_joint,
+                 seq_data)
 
             # Save 'last' checkpoint (crash-recovery + --resume): model +
             # optimizer together so a resumed run continues with consistent
@@ -1113,8 +1171,8 @@ def step_train_model(args, cfg, graphs, radii, preloaded=None):
 
     if joint:
         if preloaded is not None:
-            list_of_edge_indices, list_of_target_adjs, radii_list, lake_ids_list = \
-                preloaded['joint']
+            (list_of_edge_indices, list_of_target_adjs, radii_list,
+             lake_ids_list, recon_weights_list) = preloaded['joint']
             n_graphs = preloaded['n_loaded']
             print(f"  Using pre-loaded data: {n_graphs} graphs "
                   f"({len(lake_names)} unique lakes)")
@@ -1124,6 +1182,7 @@ def step_train_model(args, cfg, graphs, radii, preloaded=None):
             list_of_target_adjs = []
             radii_list = []
             lake_ids_list = []
+            recon_weights_list = []
 
             keys_sorted = sorted(graphs.keys())
             n_total = len(keys_sorted)
@@ -1132,6 +1191,7 @@ def step_train_model(args, cfg, graphs, radii, preloaded=None):
             for key in tqdm(keys_sorted, desc="  Loading graphs", unit="key"):
                 graph_entry = graphs[key]
                 bundled_r = None
+                graph_list = None
 
                 if isinstance(graph_entry, (str, os.PathLike)):
                     payload = torch.load(os.fspath(graph_entry),
@@ -1149,20 +1209,21 @@ def step_train_model(args, cfg, graphs, radii, preloaded=None):
                         raise KeyError(
                             f"Bundle for {key} missing 'graphs' key — "
                             f"not a degenerate sentinel (has {sorted(payload.keys())})")
-                    graph = payload['graphs'][0]
+                    graph_list = payload['graphs']
                     bundled_r = payload.get('radii')
                 elif isinstance(graph_entry, (list, tuple)):
-                    graph = graph_entry[0]
+                    graph_list = list(graph_entry)
                 elif isinstance(graph_entry, dict) and graph_entry.get('degenerate'):
                     skipped_degenerate.append(str(key))
                     continue
                 else:
-                    graph = graph_entry
+                    graph_list = [graph_entry]
 
-                list_of_edge_indices.append(graph.edge_index)
-                list_of_target_adjs.append(graph.target_adj)
+                if not graph_list:
+                    continue
 
-                r = _resolve_graph_radii(key, radii, bundled_r, graph.num_nodes)
+                r = _resolve_graph_radii(key, radii, bundled_r,
+                                         graph_list[0].num_nodes)
                 # ORIGINAL (uncomment if _resolve_graph_radii breaks):
                 # r = radii.get(str(key))
                 # if r is None and bundled_r is not None:
@@ -1179,10 +1240,17 @@ def step_train_model(args, cfg, graphs, radii, preloaded=None):
                 # r = np.asarray(r, dtype=np.float32)
                 if args.noise_scale != 0:
                     r = r * float(args.noise_scale)
-                radii_list.append(r)
 
+                # Train on EVERY reconstruction level; level i (0-based)
+                # gets its reconstruction loss divided by (i+1) so denser
+                # levels don't dominate.
                 lake_name = str(key).split(' (')[0]
-                lake_ids_list.append(lake_name_to_id[lake_name])
+                for i, graph in enumerate(graph_list):
+                    list_of_edge_indices.append(graph.edge_index)
+                    list_of_target_adjs.append(graph.target_adj)
+                    radii_list.append(r)
+                    recon_weights_list.append(1.0 / (i + 1))
+                    lake_ids_list.append(lake_name_to_id[lake_name])
 
             if skipped_degenerate:
                 print(f"  Skipped {len(skipped_degenerate)} degenerate "
@@ -1198,8 +1266,11 @@ def step_train_model(args, cfg, graphs, radii, preloaded=None):
             epochs=args.epochs,
             lr=args.lr,
             commit_alpha=args.commit_alpha,
-            radii=radii_list,
+            # --noise-scale 0 disables noise entirely: pass radii=None so the
+            # unscaled radii are not injected (they otherwise would be).
+            radii=radii_list if args.noise_scale != 0 else None,
             lake_ids=lake_ids_list,
+            recon_weights=recon_weights_list,
         )
     else:
         from surge.embedder import LakeEmbedder
@@ -1238,7 +1309,15 @@ def step_generate_embeddings(args, graphs, model):
 
     print("[Step 4] Generating VQ code histogram embeddings...")
     embedder = LakeEmbedder(model, device=args.device)
-    embeddings = embedder.embed_all(graphs)
+    # A jointly-trained model must be conditioned on the same lake indices
+    # used at training time, or its learned per-lake shift is silently
+    # dropped.  Build the mapping from the same sorted-lake-name scheme that
+    # the training path uses so the indices line up.
+    lake_name_to_id = {
+        name: i for i, name in enumerate(
+            sorted(set(str(k).split(' (')[0] for k in graphs.keys())))
+    } if getattr(model, 'lake_emb', None) is not None else None
+    embeddings = embedder.embed_all(graphs, lake_name_to_id=lake_name_to_id)
 
     save_pickle(embeddings, embeddings_path)
     print(f"  Saved {len(embeddings)} embeddings to {embeddings_path}")
@@ -1261,7 +1340,12 @@ def step_build_gene_mappings(args, graphs, model, sd):
 
     print("[Step 5] Building gene-VQ code mappings...")
     embedder = LakeEmbedder(model, device=args.device)
-    vq_to_gene, gene_to_vq = embedder.build_gene_vq_mappings(graphs)
+    lake_name_to_id = {
+        name: i for i, name in enumerate(
+            sorted(set(str(k).split(' (')[0] for k in graphs.keys())))
+    } if getattr(model, 'lake_emb', None) is not None else None
+    vq_to_gene, gene_to_vq = embedder.build_gene_vq_mappings(
+        graphs, lake_name_to_id=lake_name_to_id)
 
     gene_names = sd.gene_names if hasattr(sd, 'gene_names') else None
     mappings = {
@@ -1302,7 +1386,9 @@ def step_temporal_slopes(args, embeddings, sd):
     per_strat = {}
     for strat in ['year_lake', 'sex_year_lake', 'infection_year_lake']:
         sub = analyzer.for_stratification(strat)
-        wass = sub.wasserstein_temporal(base_year=args.base_year)
+        # Skip suffixed stratifications that have no unambiguous per-lake
+        # temporal series (sex/infection), loudly.
+        wass = sub.wasserstein_temporal_or_skip(base_year=args.base_year)
         if not wass or len(wass) < 3:
             per_strat[strat] = {'error': 'too few lakes with temporal data'}
             continue
@@ -1586,7 +1672,7 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
         print(f"    Saved pca_genotype_{strat}.png")
 
         # -- Wasserstein temporal grid (per-stratification) --
-        sub_wass = sub.wasserstein_temporal(base_year=args.base_year)
+        sub_wass = sub.wasserstein_temporal_or_skip(base_year=args.base_year)
         if sub_wass:
             sub_wass_scaled, sub_p95 = LakeAnalyzer.scale_wasserstein_p95(sub_wass)
             n_lakes = len(sub_wass_scaled)
@@ -2016,7 +2102,13 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                     'Lake': lake,
                     'Year': str(year) if year is not None else 'unknown',
                     'Lake Category': str(sd_obj.get_lake_role(lake)),
+                    # Ecotype (ancestry) and Lake Habitat are SEPARATE factors:
+                    # a recipient lake's physical habitat can differ from the
+                    # ancestry of its transplanted fish (e.g. Fred/Ranchero are
+                    # Limnetic-ancestry but Benthic-habitat).  Source lakes fall
+                    # back to habitat == ecotype.
                     'Ecotype': str(sd_obj.get_lake_ecotype(lake)),
+                    'Lake Habitat': str(sd_obj.get_lake_habitat(lake)),
                 }
                 # Ancestry (GenotypePool) — meaningful for recipient lakes
                 anc = sd_obj.get_genotype(lake)
@@ -2390,14 +2482,14 @@ def main():
     # Configuration derived from data — n_genes is set automatically
     cfg = {
         'stratifications': ['year_lake', 'sex_year_lake', 'infection_year_lake'],
-        'n_eigencomponents': 33,
-        'reconstruction_levels': [2, 4, 16, 32],
+        'n_eigencomponents': 17,
+        'reconstruction_levels': [2, 4, 16],
         'in_channels': 64,
         'hidden_channels': 64,
-        'out_channels': 16,
+        'out_channels': 8,
         'num_layers': 3,
         'dropout': 0.2,
-        'codebook_channels': 16,
+        'codebook_channels': 8,
         'codebook_size': args.codebook_size,
         'decoder_channels': 64,
     }

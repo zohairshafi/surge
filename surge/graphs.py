@@ -1,18 +1,28 @@
 """
 CoexpressionGraphBuilder: Construct gene co-expression networks from expression matrices.
 
-For a given expression matrix M (fish × genes), the gene-gene adjacency is:
-    adj = M.T @ M
+For a given expression matrix M (fish × genes), each gene is first z-scored
+across fish (centered + scaled), then the gene-gene adjacency is:
+    adj = Mz.T @ Mz
 
-This captures how strongly each pair of genes co-varies across fish in that group.
+Because the z-scored matrix has zero mean per gene, this Gram matrix is
+proportional to the Pearson correlation matrix of the genes (up to the n-1
+scale factor), is symmetric positive semi-definite, and CAN be negative
+between anti-correlated genes — unlike the previous uncentered ``M.T @ M``,
+which was dominated by mean abundance and could never express anti-correlation.
+
 The adjacency is then decomposed via eigendecomposition, reconstructed at multiple
-scales (k = 4, 8, 32, 64, 127 components), binarized at mean threshold, and
-converted to sparse edge-index format for GNN training.
+scales (k = 4, 8, 32, 64, 127 components), binarized at a per-level
+density quantile ramping from 1% to 5%, and converted to sparse edge-index
+format for GNN training.
 
-Node uncertainty radii are computed as the consistency of each gene's connection
-probability across reconstruction scales — genes that flip between connected and
-disconnected at different scales get high radii (high uncertainty), which is used
-as Gaussian noise injection during VQGNN training.
+Node uncertainty radii are computed as the average ambiguity of each gene's
+connections within each reconstruction level: ``per_gene = 1 - mean(|2r - 1|)``
+over the min-max-scaled reconstruction (r ∈ [0, 1]).  Genes whose reconstructed
+edge weights sit near 0.5 (ambiguous) get high radii (high uncertainty), which
+is used as Gaussian noise injection during VQGNN training.  NOTE: this measures
+proximity-to-0.5 within each level — it does NOT measure "flipping between
+connected/disconnected across scales" (an older, incorrect docstring claim).
 """
 
 import os
@@ -36,6 +46,12 @@ class CoexpressionGraphBuilder:
     reconstruction_levels : list[int]
         Component counts at which to reconstruct and binarize the adjacency.
         Default: [4, 8, 32, 64, 127]
+    target_density : float or None (default 0.01)
+        Starting edge density for binarization.  When set, densities ramp
+        across reconstruction levels from ``target_density`` to
+        ``min(target_density + 0.04, 0.05)`` in 1% steps (e.g. 1% → 2% →
+        3% → 4% → 5%).  When None, falls back to the per-level mean
+        threshold.
     device : str or torch.device
         Device for the resulting tensors.
 
@@ -45,14 +61,17 @@ class CoexpressionGraphBuilder:
         One graph per reconstruction level, with edge_index in sparse COO format.
     radii : np.ndarray (n_genes,)
         Node uncertainty scores in [0, 1], normalized across genes.
-        Higher = more inconsistent across scales = more noise injected during training.
+        Higher = more ambiguous connections (reconstructed edge weights near
+        0.5) = more noise injected during training.
     """
 
     def __init__(self, n_eigencomponents=128,
                  reconstruction_levels=None,
+                 target_density=0.01,
                  device='cpu'):
         self.n_eigencomponents = n_eigencomponents
         self.reconstruction_levels = reconstruction_levels or [4, 8, 32, 64, 127]
+        self.target_density = target_density
         self.device = device
 
     # ------------------------------------------------------------------
@@ -82,10 +101,19 @@ class CoexpressionGraphBuilder:
         eigvals, eigvecs = self._eigendecompose(adj)
         del adj  # free ~6.3 GB; no longer needed after eigendecomposition
         print ("Reconstructing graphs at multiple scales...")
-        sparse_graphs, radii = self._multi_scale_reconstruct(eigvals, eigvecs)
+        sparse_graphs, radii = self._multi_scale_reconstruct(
+            eigvals, eigvecs, target_density=self.target_density)
         if not sparse_graphs:
             return None, np.ones(expression_matrix.shape[1] if expression_matrix.ndim == 2 else 0)
-        # Skip degenerate graphs: all-empty or all-dense (> 99.9% edges)
+        # Skip degenerate graphs: all-empty or all-dense (> 99.9% edges).
+        # Loudly flag any INTERMEDIATE empty level too — it would silently
+        # pass the densest-level check while contributing a zero-edge graph.
+        empty_levels = [k for g, k in zip(sparse_graphs, self.reconstruction_levels)
+                        if g.edge_index.shape[1] == 0]
+        if empty_levels:
+            print(f"  WARNING: {len(empty_levels)} reconstruction level(s) "
+                  f"produced 0 edges: k={empty_levels} — training-weight "
+                  f"alignment assumes all levels present.")
         n_edges = sparse_graphs[-1].edge_index.shape[1]
         n_genes = expression_matrix.shape[1]
         max_edges = n_genes * (n_genes - 1)
@@ -180,7 +208,7 @@ class CoexpressionGraphBuilder:
         else:
             threshold = float(np.mean(recon))
 
-        binary_adj = recon > threshold
+        binary_adj = recon >= threshold
         del recon
         np.fill_diagonal(binary_adj, False)
 
@@ -204,18 +232,43 @@ class CoexpressionGraphBuilder:
 
     def _compute_adjacency(self, M):
         """
-        Compute gene-gene co-expression adjacency: adj = M.T @ M.
+        Compute the gene-gene co-expression adjacency: the correlation of
+        CLR-transformed relative abundances.
 
-        The (i,j) entry is the dot product of gene i's and gene j's expression
-        profiles across all fish in the group. Min-max scaled to [0, 1].
+        Input ``M`` is relative abundance (each fish's row sums to 1) —
+        compositional data.  Compositional data forces spurious negative
+        correlations across genes, so the standard treatment (also used by the
+        WGCNA baseline) is the centered log-ratio transform:
+            CLR(x) = log(x) - mean(log(x))   per fish
+        applied BEFORE the per-gene z-score, so the Gram matrix below is the
+        correlation of CLR values — the same data representation the WGCNA
+        baseline analyzes, making the SURGE-vs-WGCNA comparison apples-to-
+        apples.  (The earlier code z-scored raw relative abundance, whose
+        unit-sum constraint distorted every correlation.)
+
+        Because genes are centered after CLR, adj[i, j] is the (n-1)-scaled
+        Pearson correlation between genes i and j: symmetric PSD, and NEGATIVE
+        for anti-correlated genes.  Returns the raw Gram matrix (NOT min-max
+        scaled): min-max scaling here would break the PSD property that
+        _eigendecompose relies on, and every downstream reconstruction is
+        rescaled internally before binarization anyway.
         """
         M = np.asarray(M, dtype=np.float32)
-        adj = M.T @ M
-        # Min-max normalization (in-place to avoid temporaries)
-        adj_min, adj_max = adj.min(), adj.max()
-        if adj_max > adj_min:
-            adj -= adj_min
-            adj /= (adj_max - adj_min)
+        if M.ndim != 2 or M.shape[0] < 2:
+            raise ValueError(
+                f"_compute_adjacency needs a (fish x genes) matrix with >= 2 "
+                f"fish, got shape {M.shape}")
+        # CLR per fish (zero-replacement with a small pseudo-count).
+        M = np.clip(M, 1e-8, None)
+        logM = np.log(M)
+        M = logM - logM.mean(axis=1, keepdims=True)
+        # Z-score each gene across fish, then the Gram matrix is correlation.
+        gene_mean = M.mean(axis=0, keepdims=True)
+        gene_std = M.std(axis=0, keepdims=True)
+        # Constant genes (std == 0) would divide by zero; their z-scores are
+        # all zero (uncorrelated with everything) rather than NaN.
+        Mz = (M - gene_mean) / np.where(gene_std > 0, gene_std, 1.0)
+        adj = Mz.T @ Mz
         return adj
 
     # ------------------------------------------------------------------
@@ -226,8 +279,12 @@ class CoexpressionGraphBuilder:
         """
         Compute top-k eigenvalues and eigenvectors of the adjacency matrix.
 
-        Since adj = M.T @ M, it is symmetric positive semi-definite, so all
-        eigenvalues are real and non-negative. We take the top k by magnitude.
+        Since adj = Mz.T @ Mz (the z-scored Gram from _compute_adjacency), it
+        is symmetric positive semi-definite, so all eigenvalues are real and
+        non-negative.  We take the top k by magnitude.  (The min-max scaling
+        that used to be applied inside _compute_adjacency broke this PSD
+        property — the scaled matrix could be indefinite and eigsh would return
+        negative eigenvalues among the top-k.)
         """
         n = adj.shape[0]
         k = min(self.n_eigencomponents, n - 2)
@@ -243,7 +300,7 @@ class CoexpressionGraphBuilder:
         # Provide an explicit non-zero start vector to stabilize ARPACK.
         v0 = np.full(n, 1.0 / np.sqrt(n), dtype=np.float32)
         try:
-            vals, vecs = eigsh(adj, k=k, which='LM')
+            vals, vecs = eigsh(adj, k=k, which='LM', v0=v0)
         except Exception:
             # Retry with a tiny diagonal jitter for near-degenerate matrices.
             vals, vecs = eigsh(adj + 1e-8 * np.eye(n, dtype=np.float32),
@@ -261,7 +318,7 @@ class CoexpressionGraphBuilder:
     # Step 3: Multi-scale reconstruction & binarization
     # ------------------------------------------------------------------
 
-    def _multi_scale_reconstruct(self, eigvals, eigvecs):
+    def _multi_scale_reconstruct(self, eigvals, eigvecs, target_density=None):
         """
         Reconstruct adjacency at multiple scales, binarize, and compute
         node uncertainty radii.
@@ -270,8 +327,11 @@ class CoexpressionGraphBuilder:
             recon = V_k @ diag(S_k) @ V_k.T   (truncated spectral reconstruction)
         where V_k = first k eigenvectors, S_k = first k eigenvalues.
 
-        Each reconstruction is min-max scaled to [0, 1] and binarized at its
-        own per-level mean threshold.
+        Each reconstruction is min-max scaled to [0, 1] and binarized.  When
+        *target_density* is given, the threshold is set at a per-level quantile
+        that ramps from ``target_density`` to ``min(target_density + 0.04, 0.05)``
+        in 1% increments across reconstruction levels (e.g. 1% → 2% → … → 5%).
+        When *target_density* is None, the per-level mean is used instead.
 
         Node uncertainty = 1 - avg(|2x-1|) across scales.
         This measures how often a gene's connections are "ambiguous" (near 0.5
@@ -308,8 +368,14 @@ class CoexpressionGraphBuilder:
                 recon /= (r_max - r_min)
 
             # ---- Binarize (non-destructive: creates boolean array) ----
-            threshold = float(np.mean(recon))
-            binary_adj = recon > threshold
+            if target_density is not None:
+                level_density = min(target_density + n_levels * 0.01, 0.05)
+                threshold = float(np.quantile(recon, 1.0 - level_density))
+            else:
+                threshold = float(np.mean(recon))
+            # Inclusive threshold: strict '>' undershoots the target density
+            # whenever values tie exactly at the quantile.
+            binary_adj = recon >= threshold
             np.fill_diagonal(binary_adj, False)
             rows, cols = np.where(binary_adj)
             n_edges = len(rows)
@@ -445,10 +511,16 @@ class CoexpressionGraphBuilder:
         print(f"Graph stats saved to {csv_path}")
 
     @staticmethod
-    def _config_hash(n_eigencomponents, reconstruction_levels):
-        """Short hash of graph construction parameters for cache validation."""
+    def _config_hash(n_eigencomponents, reconstruction_levels, target_density=None):
+        """Short hash of graph construction parameters for cache validation.
+
+        target_density directly changes the binarization threshold (and hence
+        every graph's edge set), so it MUST be part of the cache key — omitting
+        it silently served stale bundles when the density target changed.
+        """
         import hashlib
-        payload = f"{n_eigencomponents}|{'_'.join(map(str, reconstruction_levels))}"
+        payload = (f"{n_eigencomponents}|{'_'.join(map(str, reconstruction_levels))}"
+                   f"|target_density={target_density}")
         return hashlib.md5(payload.encode()).hexdigest()[:8]
 
     @staticmethod
@@ -526,6 +598,7 @@ class CoexpressionGraphBuilder:
 
         config_hash = self._config_hash(
             self.n_eigencomponents, self.reconstruction_levels,
+            self.target_density,
         )
 
         graphs = {}

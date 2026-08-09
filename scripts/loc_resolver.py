@@ -97,10 +97,12 @@ class GeneNameResolver:
                 # TSV says it's still LOC → genuinely unresolved
                 return None
 
-        # 2. NCBI JSON cache
-        cached = self._ncbi_cache.get(name)
-        if cached is not None:
-            return cached  # may be None (previously queried, unresolved)
+        # 2. NCBI JSON cache.  Use `in` (not `.get(...) is not None`): a cached
+        # None means "previously queried and confirmed unresolved" and must be
+        # treated as a HIT — otherwise unresolvable LOC genes were re-queried
+        # on every call.
+        if name in self._ncbi_cache:
+            return self._ncbi_cache[name]  # may be None (confirmed unresolved)
 
         # 3. mygene.info batch-friendly lookup (single-gene fallback)
         if self._use_mygene:

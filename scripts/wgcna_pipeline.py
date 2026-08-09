@@ -21,9 +21,9 @@ Comparisons:
 
 Usage:
     python scripts/wgcna_pipeline.py \
-        --matrices output/matrices.pkl \
-        --gene-mappings output/gene_mappings.pkl \
-        --output-dir output/wgcna \
+        --matrices rol/output/matrices.pkl \
+        --gene-mappings rol/output/gene_mappings.pkl \
+        --output-dir rol/output/wgcna \
         --top-n-genes 5000 --min-expression 1e-5
 """
 
@@ -47,6 +47,22 @@ from tqdm import tqdm
 
 GPROFILER_CONVERT_URL = "https://biit.cs.ut.ee/gprofiler/api/convert/convert/"
 GPROFILER_GOST_URL   = "https://biit.cs.ut.ee/gprofiler/api/gost/profile/"
+
+
+def benjamini_hochberg(pvals):
+    """Benjamini-Hochberg FDR q-values (same length/order as input)."""
+    p = np.asarray(pvals, dtype=float)
+    n = len(p)
+    if n == 0:
+        return p
+    order = np.argsort(p)
+    ranked = p[order]
+    q = ranked * n / np.arange(1, n + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    q = np.clip(q, 0.0, 1.0)
+    out = np.empty(n, dtype=float)
+    out[order] = q
+    return out
 
 
 def convert_to_ensembl(genes, organism="gaculeatus"):
@@ -99,6 +115,36 @@ def run_enrichment(ensembl_ids, organism="gaculeatus",
 # Gene filtering
 # ===========================================================================
 
+def relative_abundance_to_clr(X, pseudo_count=1e-8):
+    """Centered log-ratio (CLR) transform for compositional data.
+
+    matrices.pkl stores RELATIVE ABUNDANCE (each fish's row sums to 1) —
+    compositional data.  WGCNA needs log-scale expression, but the old
+    pseudo-CPM transform (log2(RA*1e6+1)) did NOT remove the closure-induced
+    structure: RA*1e6 is a constant total per fish (discarding library-depth
+    variation), and a per-gene monotone log cannot undo the spurious negative
+    correlations the unit-sum constraint forces across genes.
+
+    CLR is the standard treatment for compositionality: log(x) - mean(log(x))
+    per sample.  Zeros get a multiplicative pseudo-count replacement.
+
+    Parameters
+    ----------
+    X : np.ndarray (n_samples, n_genes)
+        Non-negative relative abundances (rows sum to 1).
+    pseudo_count : float
+        Floor applied before log (zero-replacement).
+
+    Returns
+    -------
+    np.ndarray (n_samples, n_genes) — CLR-transformed (not row-sum constrained).
+    """
+    X = np.asarray(X, dtype=np.float64)
+    X = np.clip(X, pseudo_count, None)
+    logX = np.log(X)
+    return logX - logX.mean(axis=1, keepdims=True)
+
+
 def filter_genes_two_stage(matrices, gene_names, min_expression=0.0,
                            top_n=None):
     """Two-stage gene filter: expression floor, then variance top-N.
@@ -111,20 +157,26 @@ def filter_genes_two_stage(matrices, gene_names, min_expression=0.0,
     if top_n is not None and top_n >= n_original:
         top_n = None
 
-    # Pool expression for per-gene statistics
+    # Pool expression for per-gene statistics.  Variance for the top-N filter
+    # must be computed on the SAME scale WGCNA analyzes (CLR / log-scale).
+    # Ranking on pooled raw relative abundance selected a different gene set —
+    # raw-RA variance is dominated by a few high-abundance genes.
     all_expr = []
     for M in matrices.values():
         M = np.asarray(M, dtype=np.float64)
         if M.shape[0] > 0:
             all_expr.append(M)
     pooled = np.vstack(all_expr)
-    gene_means = np.mean(pooled, axis=0)
-    gene_vars = np.var(pooled, axis=0)
+    # Expression floor is on RAW relative abundance (the same semantics the
+    # CLI documents); variance ranking is on CLR (the analysis scale).
+    raw_means = np.mean(pooled, axis=0)
+    pooled_clr = relative_abundance_to_clr(pooled)
+    gene_vars = np.var(pooled_clr, axis=0)
     keep_mask = np.ones(n_original, dtype=bool)
 
-    # Stage 1: expression floor
+    # Stage 1: expression floor (raw relative-abundance mean)
     if min_expression > 0:
-        expr_keep = gene_means >= min_expression
+        expr_keep = raw_means >= min_expression
         n_removed = int((~expr_keep).sum())
         keep_mask &= expr_keep
         print(f"  Expression filter: removed {n_removed} genes "
@@ -180,14 +232,13 @@ def build_group_expression(matrices, keys, gene_names, sample_prefix):
         sample_ids.extend([f'{sample_prefix}_{clean}_{i}' for i in range(n_fish)])
 
     X = np.vstack(arrays)
-    # matrices.pkl stores RELATIVE ABUNDANCE (each fish's row sums to 1),
-    # which is the correct input for the spectral adjacency M.T @ M but is
-    # compositional (sum-constrained) and therefore the WRONG input for WGCNA.
-    # Compositional data forces spurious negative correlations across all
-    # genes, collapsing WGCNA into a single module.  WGCNA requires log-scale
-    # expression, so convert relative abundance -> CPM -> log2(CPM+1):
-    # relative_abundance * 1e6 ≈ counts-per-million (rel_abund = count/total).
-    X = np.log2(X * 1e6 + 1.0)
+    # matrices.pkl stores RELATIVE ABUNDANCE (each fish's row sums to 1) —
+    # compositional data.  The old pseudo-CPM transform (log2(RA*1e6+1)) did
+    # NOT remove the closure-induced structure (RA*1e6 is a constant total per
+    # fish, and the log is monotone, so the spurious cross-gene negative
+    # correlations from the unit-sum constraint remained).  Use the centered
+    # log-ratio transform — the standard treatment for compositional data.
+    X = relative_abundance_to_clr(X)
     expr_df = pd.DataFrame(X, index=sample_ids, columns=gene_names)
     expr_df.index.name = 'sample_id'
 
@@ -215,7 +266,7 @@ def run_wgcna(name, expr_df, sample_info, output_dir):
         geneExp=expr_df,
         sampleInfo=sample_info,
         TPMcutoff=0,
-        RsquaredCut=0.75,
+        RsquaredCut=0.85,
         networkType='signed hybrid',
         TOMType='signed',
         minModuleSize=30,
@@ -234,8 +285,31 @@ def run_wgcna(name, expr_df, sample_info, output_dir):
         msg = (e.args[0] if (hasattr(e, 'args') and e.args) else str(e))
         print(f"  [{name}] WGCNA failed: {msg}")
         print(f"  [{name}] Skipping — too few samples or weak co-expression "
-              f"in this group (WGCNA needs ~15+ samples for stable modules).")
+              f"in this group (WGCNA needs ~7+ samples for stable modules).")
         return None
+
+    # LOUD soft-threshold quality check.  PyWGCNA silently falls back to the
+    # highest-R2 power (typically the largest tested, e.g. 20) when NO power
+    # reaches RsquaredCut.  On compositional-derived data the scale-free fit
+    # often never qualifies, so the network may be built at an extreme power
+    # without anyone noticing.  Surface it prominently.
+    try:
+        sft = getattr(wgcna, 'sft', None)
+        if sft is not None:
+            sft_r2 = getattr(sft, 'SFT.R.sq', None)
+            sft_power = getattr(sft, 'powerEstimate', None) or getattr(
+                sft, 'fitIndices', None)
+            if sft_r2 is not None:
+                best_r2 = float(np.max(sft_r2))
+                if best_r2 < 0.85:
+                    print(f"  [{name}] WARNING: no soft-threshold power reached "
+                          f"RsquaredCut=0.85 (best scale-free R² = {best_r2:.3f}). "
+                          f"PyWGCNA silently used the max-R² power; modules may "
+                          f"be unreliable. Inspect the SFT curve before trusting "
+                          f"these modules.")
+    except Exception as exc:
+        print(f"  [{name}] NOTE: could not inspect soft-threshold fit "
+              f"({exc}) — skipping quality check.")
 
     modules = wgcna.getModuleName()
     # Count genes per module (exclude grey = unassigned)
@@ -356,10 +430,8 @@ def identify_preserved_modules(preservation, name_a, name_b,
     """
     j_ab = preservation['a_ref']['jaccard']
     p_ab = preservation['a_ref']['pvalue']
-    j_ba = preservation['b_ref']['jaccard']
-    p_ba = preservation['b_ref']['pvalue']
 
-    if j_ab is None or j_ba is None:
+    if j_ab is None or preservation['b_ref']['jaccard'] is None:
         print("  Module preservation failed — skipping preserved module "
               "identification")
         return set(), pd.DataFrame()
@@ -372,8 +444,7 @@ def identify_preserved_modules(preservation, name_a, name_b,
     a_modules = [c for c in j_ab.index if c.startswith(prefix_a)]
     b_modules = [c for c in j_ab.columns if c.startswith(prefix_b)]
 
-    preserved_a = set()
-    preserved_b = set()
+    preserved_pairs = set()
     rows = []
 
     for mod_a_full in a_modules:
@@ -382,6 +453,7 @@ def identify_preserved_modules(preservation, name_a, name_b,
             continue
         best_b_full = None
         best_j = 0
+        best_p = 1.0
         for mod_b_full in b_modules:
             mod_b_color = mod_b_full.split(':', 1)[1]
             if mod_b_color == 'grey':
@@ -391,34 +463,32 @@ def identify_preserved_modules(preservation, name_a, name_b,
             if j >= jaccard_threshold and p <= pvalue_threshold:
                 if j > best_j:
                     best_j = j
+                    best_p = p
                     best_b_full = mod_b_full
         if best_b_full is not None:
+            # NOTE: the OLD code additionally required the reverse direction
+            # (B-as-ref → A-as-test).  That check was VACUOUS: Jaccard is
+            # symmetric and Fisher's exact p is invariant to transposing the
+            # table, so j_ba[...] == j_ab[...] and p_ba[...] == p_ab[...]
+            # exactly — the reverse branch could never reject a pair.  It has
+            # been removed; a single-direction test is equivalent.
             mod_b_color = best_b_full.split(':', 1)[1]
-            # Check reverse: is the B module preserved back to the A module?
-            # In the B-ref matrix, rows are prefixed with name_b, cols with name_a.
-            j_rev = j_ba.loc[best_b_full, mod_a_full]
-            p_rev = p_ba.loc[best_b_full, mod_a_full]
-            if j_rev >= jaccard_threshold and p_rev <= pvalue_threshold:
-                preserved_a.add(mod_a_color)
-                preserved_b.add(mod_b_color)
-                rows.append({
-                    'module_a': mod_a_color,
-                    'module_b': mod_b_color,
-                    'jaccard_ab': round(float(j), 4),
-                    'pvalue_ab': round(float(p), 6),
-                    'jaccard_ba': round(float(j_rev), 4),
-                    'pvalue_ba': round(float(p_rev), 6),
-                })
+            preserved_pairs.add(f'{mod_a_color}|{mod_b_color}')
+            rows.append({
+                'module_a': mod_a_color,
+                'module_b': mod_b_color,
+                'jaccard_ab': round(float(best_j), 4),
+                'pvalue_ab': round(float(best_p), 6),
+            })
 
-    print(f"  Preserved modules: {len(preserved_a)} from {name_a}, "
-          f"{len(preserved_b)} from {name_b} "
+    print(f"  Preserved modules: {len(preserved_pairs)} module PAIR(s) "
           f"(Jaccard ≥ {jaccard_threshold}, Fisher p ≤ {pvalue_threshold})")
-    if preserved_a:
-        print(f"    {name_a}: {', '.join(sorted(preserved_a))}")
-    if preserved_b:
-        print(f"    {name_b}: {', '.join(sorted(preserved_b))}")
+    if preserved_pairs:
+        print(f"    {' | '.join(sorted(preserved_pairs))}")
 
-    return preserved_a | preserved_b, pd.DataFrame(rows)
+    # Return the set of preserved PAIRS — not the union of colors, which
+    # would over-count when the two groups share one color palette.
+    return preserved_pairs, pd.DataFrame(rows)
 
 
 # ===========================================================================
@@ -492,14 +562,22 @@ def eigengene_enrichment(wgcna_obj, gene_names, output_dir,
             if np.std(gene_expr) == 0:
                 continue
             corr = np.corrcoef(gene_expr, me_values)[0, 1]
-            kme_scores[gi] = abs(corr)
+            # SIGNED kME: the network is 'signed hybrid' (TOMType 'signed'),
+            # so a module's hub genes are those POSITIVELY correlated with
+            # the eigengene.  |corr| would rank anti-correlated genes (e.g.
+            # r=-0.8) ahead of +0.75 and pull in genes that oppose the module.
+            kme_scores[gi] = corr
             module_genes.add(gene_names[gi])
 
         if not kme_scores:
             continue
 
-        # Top N by kME
-        sorted_genes = sorted(kme_scores.items(), key=lambda x: -x[1])
+        # Top N by kME.  On a signed network only genes POSITIVELY correlated
+        # with the eigengene are hubs; drop any negative-kME stragglers.
+        pos_kme = {gi: k for gi, k in kme_scores.items() if k > 0}
+        if not pos_kme:
+            continue
+        sorted_genes = sorted(pos_kme.items(), key=lambda x: -x[1])
         top_genes = [gene_names[gi] for gi, _ in sorted_genes[:top_n_genes]]
 
         # Filter to "named" genes using resolver (batch-resolve, then filter)
@@ -654,14 +732,18 @@ def compare_vq_vs_wgcna(matrices, gene_mappings, wgcna_objects,
 
     if rows:
         df = pd.DataFrame(rows)
+        # BH-FDR across ALL overlap tests in this comparison — dozens to
+        # hundreds of tests with nominal p<0.05 would inflate the reported
+        # significant count.
+        df['fisher_q'] = benjamini_hochberg(df['fisher_p'].values)
         df.sort_values('jaccard', ascending=False, inplace=True)
         paradigm_suffix = f'_{paradigm}' if paradigm else ''
         csv_path = os.path.join(output_dir,
                                 f'vq_wgcna_overlap_{comparison_label}{paradigm_suffix}.csv')
         df.to_csv(csv_path, index=False)
-        n_sig = int((df['fisher_p'] < 0.05).sum())
+        n_sig = int((df['fisher_q'] < 0.05).sum())
         print(f"  VQ-WGCNA overlap: {len(df)} pairs, {n_sig} significant "
-              f"(Fisher p<0.05)")
+              f"(FDR q<0.05)")
         # Show top overlaps
         for _, row in df.head(10).iterrows():
             print(f"    VQ{row['vq_code']:3d} ↔ {row['wgcna_module']:30s}  "
@@ -866,7 +948,8 @@ def run_stratification_comparison(comparison_name, matrices, gene_names,
                                    label_a, label_b, output_dir,
                                    min_expression, top_n_genes,
                                    resolver=None, vq_csv_paths=None,
-                                   paradigm_gms=None):
+                                   paradigm_gms=None,
+                                   de_matrices=None, de_gene_names=None):
     """Run the full WGCNA pipeline for one comparison.
 
     Steps:
@@ -879,6 +962,13 @@ def run_stratification_comparison(comparison_name, matrices, gene_names,
       7. VQ vs WGCNA gene-set overlap (per paradigm when paradigm_gms given)
       8. VQ vs WGCNA enrichment term comparison
          (one pass per (path, paradigm) tuple in ``vq_csv_paths``)
+
+    ``de_matrices`` / ``de_gene_names`` (optional): the FULL unfiltered
+    expression data used for the differential-expression pre-check.  When
+    omitted, the already-filtered ``matrices``/``gene_names`` are used, which
+    made the DE check circular (variance-filtered genes are essentially
+    guaranteed to be >30% DE).  Pass the full data to check the real
+    between-group differences.
 
     Parameters
     ----------
@@ -907,8 +997,16 @@ def run_stratification_comparison(comparison_name, matrices, gene_names,
     expr_b, sinfo_b = build_group_expression(matrices, group_b_keys,
                                               gene_names, label_b)
 
-    # 2. Differential expression check
-    differential_expression_check(expr_a, expr_b, label_a, label_b)
+    # 2. Differential expression check — on the FULL (unfiltered) gene set when
+    # provided, so the ">30% DE" conclusion isn't guaranteed by variance
+    # filtering (it was circular on the top-N already-filtered genes).
+    de_a, de_b = expr_a, expr_b
+    if de_matrices is not None and de_gene_names is not None:
+        de_a, _ = build_group_expression(de_matrices, group_a_keys,
+                                         de_gene_names, label_a)
+        de_b, _ = build_group_expression(de_matrices, group_b_keys,
+                                         de_gene_names, label_b)
+    differential_expression_check(de_a, de_b, label_a, label_b)
 
     # 3. Run WGCNA
     wgcna_dir_a = os.path.join(output_dir, f'{label_a}')
@@ -1058,7 +1156,7 @@ def main():
                         help='Path to gene_mappings.pkl (for gene names + VQ data)')
 
     # Output
-    parser.add_argument('--output-dir', default='output/wgcna',
+    parser.add_argument('--output-dir', default='rol/output/wgcna',
                         help='Root output directory')
 
     # Gene filtering
@@ -1081,9 +1179,9 @@ def main():
                              'from pipeline.py step 9 for term comparison')
 
     # LOC gene resolution
-    parser.add_argument('--loc-tsv', default='output/gene_name_to_locid.tsv',
+    parser.add_argument('--loc-tsv', default='rol/output/gene_name_to_locid.tsv',
                         help='Pre-computed gene name → LOC ID TSV')
-    parser.add_argument('--loc-cache', default='output/ncbi_loc_cache.json',
+    parser.add_argument('--loc-cache', default='rol/output/ncbi_loc_cache.json',
                         help='NCBI LOC cache (fallback)')
 
     # WGCNA params
@@ -1134,6 +1232,9 @@ def main():
               f"step 7 gene overlap will only cover {this_paradigm} paradigm")
 
     # --- Gene filtering ---
+    # Keep the FULL unfiltered data for the differential-expression pre-check,
+    # which must not run on the already variance-filtered genes (circular).
+    matrices_full = matrices
     top_n = args.top_n_genes if args.top_n_genes > 0 else None
     min_expr = args.min_expression if args.min_expression > 0 else 0.0
     matrices, gene_names = filter_genes_two_stage(
@@ -1167,7 +1268,8 @@ def main():
             os.path.join(args.output_dir, 'infection'),
             args.min_expression, top_n, resolver=resolver,
             vq_csv_paths=vq_infection_csvs,
-            paradigm_gms=paradigm_gms)
+            paradigm_gms=paradigm_gms,
+            de_matrices=matrices_full, de_gene_names=gene_names_full)
         if res:
             results['infection'] = res
 
@@ -1187,11 +1289,12 @@ def main():
             os.path.join(args.output_dir, 'sex'),
             args.min_expression, top_n, resolver=resolver,
             vq_csv_paths=vq_sex_csvs,
-            paradigm_gms=paradigm_gms)
+            paradigm_gms=paradigm_gms,
+            de_matrices=matrices_full, de_gene_names=gene_names_full)
         if res:
             results['sex'] = res
 
-    # --- Comparison 3: Year (best lake) ---
+    # --- Comparison 3: Year (per-lake earliest vs latest) ---
     if not args.skip_year:
         yl_keys = [k for k in matrices
                    if (re.search(r'\(\d{4}\.\d\)$', str(k))
@@ -1208,33 +1311,47 @@ def main():
                 yr = int(yr_match.group(1))
                 lake_year_counts.setdefault(lake, {})[yr] = matrices[k].shape[0]
 
-        best_lake = None
-        best_total = 0
+        qualifying = []
         for lake, years in lake_year_counts.items():
-            if 2019 in years and 2023 in years:
-                total = years[2019] + years[2023]
-                if total > best_total:
-                    best_total = total
-                    best_lake = lake
+            sorted_yrs = sorted(years)
+            if len(sorted_yrs) >= 2:
+                early, late = sorted_yrs[0], sorted_yrs[-1]
+                # 7 = minimum samples for a stable correlation estimate
+                # (matches the pipeline min_fish; could become a CLI flag)
+                if years[early] >= 7 and years[late] >= 7:
+                    qualifying.append((lake, early, late,
+                                       years[early] + years[late]))
 
-        if best_lake is None:
-            print("\n  Year comparison SKIPPED: no lake has both 2019 and 2023 data")
+        if not qualifying:
+            print("\n  Year comparison SKIPPED: no lake has enough fish "
+                  "at multiple timepoints")
         else:
-            keys_2019 = [k for k in yl_keys
-                         if str(k).startswith(best_lake)
-                         and re.search(r'\(2019\.\d\)$', str(k))]
-            keys_2023 = [k for k in yl_keys
-                         if str(k).startswith(best_lake)
-                         and re.search(r'\(2023\.\d\)$', str(k))]
+            qualifying.sort(key=lambda x: -x[3])  # most fish first
+            print(f"\n  Year contrast: {len(qualifying)} qualifying lakes "
+                  f"(≥7 fish at both timepoints):")
+            for lake, early, late, total in qualifying:
+                print(f"    {lake}: {early}→{late} ({total} fish)")
 
-            res = run_stratification_comparison(
-                'year', matrices, gene_names, gm,
-                keys_2019, keys_2023, f'{best_lake}_2019', f'{best_lake}_2023',
-                os.path.join(args.output_dir, 'year'),
-                args.min_expression, top_n, resolver=resolver,
-                paradigm_gms=paradigm_gms)
-            if res:
-                results['year'] = res
+            for lake, early, late, _ in qualifying:
+                keys_early = [k for k in yl_keys
+                              if str(k).startswith(lake)
+                              and re.search(rf'\({early}\.\d\)$', str(k))]
+                keys_late = [k for k in yl_keys
+                             if str(k).startswith(lake)
+                             and re.search(rf'\({late}\.\d\)$', str(k))]
+                comparison = f'year_{lake}'
+
+                res = run_stratification_comparison(
+                    comparison, matrices, gene_names, gm,
+                    keys_early, keys_late,
+                    f'{lake}_{early}', f'{lake}_{late}',
+                    os.path.join(args.output_dir, 'year', lake),
+                    args.min_expression, top_n, resolver=resolver,
+                    paradigm_gms=paradigm_gms,
+                    de_matrices=matrices_full,
+                    de_gene_names=gene_names_full)
+                if res:
+                    results[comparison] = res
 
     # --- Summary ---
     print(f"\n{'='*70}")

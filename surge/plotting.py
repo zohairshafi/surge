@@ -96,16 +96,21 @@ class LakePlotter:
     # Wasserstein temporal grid
     # ------------------------------------------------------------------
 
-    # Colour map for lake role × ecotype combinations
-    _ROLE_ECOTYPE_COLORS = {
+    # Colour map for lake role × LAKE HABITAT (the physical environment the
+    # fish live in — what shapes the co-expression network).  Habitat is
+    # distinct from ecotype (ancestry): a recipient lake can be Limnetic-
+    # ancestry but Benthic-habitat (e.g. Fred/Ranchero), which the old
+    # (role, ecotype) colouring could not express.  Source lakes fall back to
+    # habitat == ecotype.
+    _ROLE_HABITAT_COLORS = {
         ('Source',    'Benthic'):            '#e41a1c',  # red
         ('Source',    'Limnetic'):           '#377eb8',  # blue
         ('Recipient', 'Benthic'):            '#ff7f00',  # orange
         ('Recipient', 'Limnetic'):           '#984ea3',  # purple
-        ('Recipient', 'Limnetic+Benthic'):   '#2ca02c',  # green (mixed)
-        ('Source',    'Limnetic+Benthic'):   '#2ca02c',  # green (mixed)
+        ('Source',    'Unknown'):            '#2ca02c',
+        ('Recipient', 'Unknown'):            '#2ca02c',
     }
-    _ROLE_ECOTYPE_COLORS_DEFAULT = '#999999'   # grey for Other/Unknown
+    _ROLE_HABITAT_COLORS_DEFAULT = '#999999'   # grey for Other/Unknown
 
     @staticmethod
     def wasserstein_grid(wasserstein_distances, ncols=4, figsize=(16, 12),
@@ -145,22 +150,24 @@ class LakePlotter:
             if all_dists:
                 ymax = float(np.max(all_dists)) * 1.1
 
-        # Track which (role, ecotype) combos actually appear
+        # Track which (role, lake habitat) combos actually appear.  Habitat is
+        # the physical environment (== ecotype for source lakes; distinct for
+        # some recipients).
         seen_combos = set()
 
         for i, lake in enumerate(lakes):
             ax = axes[i]
 
-            # Determine colour from lake role × ecotype
-            color = LakePlotter._ROLE_ECOTYPE_COLORS_DEFAULT
+            # Determine colour from lake role × lake habitat
+            color = LakePlotter._ROLE_HABITAT_COLORS_DEFAULT
             label_suffix = ''
             if data is not None:
                 role = data.get_lake_role(lake)
-                ecotype = data.get_lake_ecotype(lake)
-                seen_combos.add((role, ecotype))
-                color = LakePlotter._ROLE_ECOTYPE_COLORS.get(
-                    (role, ecotype), LakePlotter._ROLE_ECOTYPE_COLORS_DEFAULT)
-                label_suffix = f' [{role} {ecotype}]'
+                habitat = data.get_lake_habitat(lake)
+                seen_combos.add((role, habitat))
+                color = LakePlotter._ROLE_HABITAT_COLORS.get(
+                    (role, habitat), LakePlotter._ROLE_HABITAT_COLORS_DEFAULT)
+                label_suffix = f' [{role} {habitat}]'
 
             years = [int(y) for y, _ in wasserstein_distances[lake]]
             dists = [d for _, d in wasserstein_distances[lake]]
@@ -186,11 +193,11 @@ class LakePlotter:
         # Legend — only show combos that actually appear in the data
         if data is not None:
             legend_elements = []
-            for (role, eco), col in LakePlotter._ROLE_ECOTYPE_COLORS.items():
-                if (role, eco) in seen_combos:
+            for (role, hab), col in LakePlotter._ROLE_HABITAT_COLORS.items():
+                if (role, hab) in seen_combos:
                     legend_elements.append(
                         Line2D([0], [0], color=col, linewidth=2, marker='o',
-                               label=f'{role} {eco}')
+                               label=f'{role} {hab}')
                     )
             fig.legend(handles=legend_elements, loc='lower center',
                        fontsize=11, ncol=5)
@@ -554,7 +561,8 @@ class LakePlotter:
 
         Visual encoding:
           - Marker shape encodes lake role (● Source, ▲ Recipient)
-          - Colour encodes ecotype (green = Benthic, blue = Limnetic)
+          - Colour encodes lake habitat (green = Benthic, blue = Limnetic),
+            which for recipient lakes can differ from ecotype/ancestry.
 
         Parameters
         ----------
@@ -584,24 +592,25 @@ class LakePlotter:
 
         # --- Visual encoding ---
         # Marker shape  → lake role  (● Source, ▲ Recipient)
-        # Marker colour → ecotype    (green Benthic, blue Limnetic)
+        # Marker colour → lake HABITAT (physical environment; for recipients
+        # it can differ from the ecotype/ancestry — see data.get_lake_habitat)
         role_marker  = {'Source': 'o', 'Recipient': '^', 'Other': 's'}
-        eco_color    = {'Benthic': '#2ca02c',    # traditional green
-                        'Limnetic': '#1f77b4',   # traditional blue
-                        'Limnetic+Benthic': '#9467bd'}  # mixed → purple
+        hab_color    = {'Benthic': '#2ca02c',    # green
+                        'Limnetic': '#1f77b4',   # blue
+                        'Unknown': '#999999'}
         default_marker = 's'
         default_color  = '#999999'
 
-        # Track which roles/ecotypes appear (for legend)
+        # Track which roles/habitats appear (for legend)
         plotted_roles = set()
-        plotted_ecos  = set()
+        plotted_habs  = set()
 
         for i, name in enumerate(lake_names):
             role = data.get_lake_role(name) if data else 'Unknown'
-            eco  = data.get_lake_ecotype(name) if data else 'Unknown'
+            hab  = data.get_lake_habitat(name) if data else 'Unknown'
 
             marker = role_marker.get(role, default_marker)
-            color  = eco_color.get(eco, default_color)
+            color  = hab_color.get(hab, default_color)
 
             ax.scatter(projected[i, 0], projected[i, 1],
                        c=color, marker=marker, s=150,
@@ -614,7 +623,7 @@ class LakePlotter:
                         color=color)
 
             plotted_roles.add((role, marker))
-            plotted_ecos.add((eco, color))
+            plotted_habs.add((hab, color))
 
         # --- Legend ---
         legend_handles = []
@@ -625,17 +634,17 @@ class LakePlotter:
                 Line2D([0], [0], marker=marker, color='black',
                        markersize=8, linestyle='None',
                        label=f'{role}'))
-        # Ecotype (colour) legend
-        for eco, color in sorted(plotted_ecos):
+        # Habitat (colour) legend
+        for hab, color in sorted(plotted_habs):
             legend_handles.append(
                 Line2D([0], [0], marker='o', color=color,
                        markersize=8, linestyle='None',
-                       label=f'{eco}'))
+                       label=f'{hab}'))
         ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})')
         ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})')
         ax.set_title('PCA of Learned Lake Embeddings (Joint Training)')
         ax.legend(handles=legend_handles, fontsize=9, loc='best',
-                  title='Lake Category (shape)  |  Ecotype (colour)')
+                  title='Lake Category (shape)  |  Lake Habitat (colour)')
 
         ax.grid(True, alpha=0.2)
         return ax

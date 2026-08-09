@@ -29,8 +29,12 @@ def load_pickle(path):
         return pickle.load(f)
 
 
-def infection_code_enrichment(embeddings, codebook_size=100):
-    """Identify VQ codes differentially used in infected vs non-infected."""
+def infection_code_enrichment(embeddings, codebook_size=None):
+    """Identify VQ codes differentially used in infected vs non-infected.
+
+    ``codebook_size`` is derived from the embedding width when not given —
+    hard-coding 100 crashed whenever a non-100 codebook was trained.
+    """
     inf_keys = [k for k in embeddings if re.search(r'\)-([01])$', str(k))]
     if not inf_keys:
         return {}
@@ -51,6 +55,8 @@ def infection_code_enrichment(embeddings, codebook_size=100):
 
     inf_arr = np.array(infected)
     ninf_arr = np.array(noninfected)
+    if codebook_size is None:
+        codebook_size = inf_arr.shape[1]
 
     from scipy.stats import mannwhitneyu
 
@@ -61,10 +67,14 @@ def infection_code_enrichment(embeddings, codebook_size=100):
         inf_mean = float(np.mean(inf_usage))
         ninf_mean = float(np.mean(ninf_usage))
         fc = (inf_mean + 1e-8) / (ninf_mean + 1e-8)
-        try:
-            _, p = mannwhitneyu(inf_usage, ninf_usage, alternative='two-sided')
-        except Exception:
-            p = 1.0
+        # No blanket try/except → p=1.0; guard only the case Mann-Whitney
+        # is genuinely undefined (all values identical across both groups).
+        pooled = np.concatenate([inf_usage, ninf_usage])
+        if np.all(pooled == pooled[0]):
+            print(f"  [export_infection_genes] code {code}: identical usage "
+                  f"across all strata — skipping.")
+            continue
+        _, p = mannwhitneyu(inf_usage, ninf_usage, alternative='two-sided')
         results[code] = {
             'infected_mean': inf_mean,
             'noninfected_mean': ninf_mean,
@@ -72,6 +82,22 @@ def infection_code_enrichment(embeddings, codebook_size=100):
             'p_value': float(p),
         }
     return results
+
+
+def benjamini_hochberg(pvals):
+    """Benjamini-Hochberg FDR q-values (same length/order as input)."""
+    p = np.asarray(pvals, dtype=float)
+    n = len(p)
+    if n == 0:
+        return p
+    order = np.argsort(p)
+    ranked = p[order]
+    q = ranked * n / np.arange(1, n + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    q = np.clip(q, 0.0, 1.0)
+    out = np.empty(n, dtype=float)
+    out[order] = q
+    return out
 
 
 def main():
@@ -113,11 +139,20 @@ def main():
         print("ERROR: No infection_year_lake keys found in embeddings")
         sys.exit(1)
 
-    sig_codes = [(code, r) for code, r in results.items()
-                 if r['p_value'] < args.p_threshold]
-    sig_codes.sort(key=lambda x: x[1]['p_value'])
+    # BH-FDR across all per-code tests — ~100 Mann-Whitney tests with nominal
+    # p<0.05 would otherwise report many spurious codes as significant.
+    codes_ordered = sorted(results.keys())
+    qvals = benjamini_hochberg(
+        [results[c]['p_value'] for c in codes_ordered])
+    for c, q in zip(codes_ordered, qvals):
+        results[c]['q_value'] = float(q)
 
-    print(f"Found {len(sig_codes)} significant codes (p < {args.p_threshold})")
+    sig_codes = [(code, r) for code, r in results.items()
+                 if r['q_value'] < args.p_threshold]
+    sig_codes.sort(key=lambda x: x[1]['q_value'])
+
+    print(f"Found {len(sig_codes)} significant codes (FDR q < "
+          f"{args.p_threshold})")
 
     if not sig_codes:
         print("No significant codes. Try a higher --p-threshold.")
@@ -129,7 +164,7 @@ def main():
 
     with open(out_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['vq_code', 'p_value', 'fold_change',
+        writer.writerow(['vq_code', 'p_value', 'q_value', 'fold_change',
                          'infected_mean', 'noninfected_mean',
                          'n_genes', 'gene_names'])
 
@@ -149,6 +184,7 @@ def main():
             writer.writerow([
                 code,
                 f"{r['p_value']:.6f}",
+                f"{r.get('q_value', float('nan')):.6f}",
                 f"{r['fold_change']:.4f}",
                 f"{r['infected_mean']:.6f}",
                 f"{r['noninfected_mean']:.6f}",
