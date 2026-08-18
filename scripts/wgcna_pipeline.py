@@ -33,6 +33,7 @@ import csv
 import os
 import pickle
 import re
+import subprocess
 import sys
 import time
 import numpy as np
@@ -63,6 +64,22 @@ def benjamini_hochberg(pvals):
     out = np.empty(n, dtype=float)
     out[order] = q
     return out
+
+
+def _hypergeom_enrichment(in_cluster, cluster_size, bg_size, bg_hit):
+    """Upper-tail hypergeometric enrichment p-value.
+
+    P(X >= in_cluster) drawing ``cluster_size`` items from a population of
+    ``bg_size`` containing ``bg_hit`` successes.  Conditioning only on the
+    cluster size and the background trait count gives the fully-contained case
+    the tiny probability it deserves, unlike Fisher's exact test which
+    conditions on both margins and reports p = 1.0 there (mirrors
+    surge/analysis.py).
+    """
+    from scipy.stats import hypergeom
+    if in_cluster <= 0 or bg_hit <= 0 or cluster_size <= 0:
+        return 1.0
+    return float(hypergeom.sf(in_cluster - 1, bg_size, bg_hit, cluster_size))
 
 
 def convert_to_ensembl(genes, organism="gaculeatus"):
@@ -145,71 +162,6 @@ def relative_abundance_to_clr(X, pseudo_count=1e-8):
     return logX - logX.mean(axis=1, keepdims=True)
 
 
-def filter_genes_two_stage(matrices, gene_names, min_expression=0.0,
-                           top_n=None):
-    """Two-stage gene filter: expression floor, then variance top-N.
-
-    Returns (filtered_matrices, filtered_gene_names).
-    """
-    n_original = len(gene_names)
-    if min_expression <= 0 and top_n is None:
-        return matrices, gene_names
-    if top_n is not None and top_n >= n_original:
-        top_n = None
-
-    # Pool expression for per-gene statistics.  Variance for the top-N filter
-    # must be computed on the SAME scale WGCNA analyzes (CLR / log-scale).
-    # Ranking on pooled raw relative abundance selected a different gene set —
-    # raw-RA variance is dominated by a few high-abundance genes.
-    all_expr = []
-    for M in matrices.values():
-        M = np.asarray(M, dtype=np.float64)
-        if M.shape[0] > 0:
-            all_expr.append(M)
-    pooled = np.vstack(all_expr)
-    # Expression floor is on RAW relative abundance (the same semantics the
-    # CLI documents); variance ranking is on CLR (the analysis scale).
-    raw_means = np.mean(pooled, axis=0)
-    pooled_clr = relative_abundance_to_clr(pooled)
-    gene_vars = np.var(pooled_clr, axis=0)
-    keep_mask = np.ones(n_original, dtype=bool)
-
-    # Stage 1: expression floor (raw relative-abundance mean)
-    if min_expression > 0:
-        expr_keep = raw_means >= min_expression
-        n_removed = int((~expr_keep).sum())
-        keep_mask &= expr_keep
-        print(f"  Expression filter: removed {n_removed} genes "
-              f"(mean < {min_expression:.2e}, {100*n_removed/n_original:.1f}%)")
-
-    # Stage 2: variance top-N
-    if top_n is not None:
-        surviving_idx = np.where(keep_mask)[0]
-        if top_n < len(surviving_idx):
-            surv_vars = gene_vars[surviving_idx]
-            var_order = np.argsort(surv_vars)[::-1]
-            top_surviving = surviving_idx[var_order[:top_n]]
-            new_mask = np.zeros(n_original, dtype=bool)
-            new_mask[top_surviving] = True
-            keep_mask = new_mask
-            print(f"  Variance filter: kept top {top_n} genes "
-                  f"(var range: {gene_vars[keep_mask].min():.2e} – "
-                  f"{gene_vars[keep_mask].max():.2e})")
-
-    final_idx = np.where(keep_mask)[0]
-    final_idx.sort()
-    print(f"  Final gene set: {len(final_idx)}/{n_original} "
-          f"({100*len(final_idx)/n_original:.1f}%)")
-
-    filtered_genes = [gene_names[i] for i in final_idx]
-    filtered_matrices = {}
-    for k, M in tqdm(matrices.items(), desc="  Subsetting matrices"):
-        M = np.asarray(M, dtype=np.float64)
-        filtered_matrices[k] = M[:, final_idx]
-
-    return filtered_matrices, filtered_genes
-
-
 # ===========================================================================
 # Expression DataFrame construction
 # ===========================================================================
@@ -254,8 +206,121 @@ def build_group_expression(matrices, keys, gene_names, sample_prefix):
 # WGCNA runner
 # ===========================================================================
 
-def run_wgcna(name, expr_df, sample_info, output_dir):
-    """Run PyWGCNA on one group. Returns WGCNA object."""
+class _DatExprShim:
+    """Lightweight stand-in for PyWGCNA's ``datExpr`` attribute.
+
+    Exposes only the members the downstream steps read: ``var['moduleColors']``
+    (pandas Series gene→color), ``var_names`` (list), and ``to_df()`` (the
+    samples × genes DataFrame, aligned to the genes WGCNA actually used).
+    """
+
+    def __init__(self, colors_series, expr_genes, df):
+        self.var = {'moduleColors': colors_series}
+        self.var_names = expr_genes
+        self._df = df
+
+    def to_df(self):
+        return self._df
+
+
+class _WGCNAResult:
+    """Lightweight stand-in for a PyWGCNA WGCNA object, rebuilt from the
+    pickle an isolated group run returns.  ``sft`` is kept for interface
+    compatibility; the soft-threshold quality check already ran in the
+    subprocess."""
+
+    def __init__(self, datExpr, MEs, sft=None):
+        self.datExpr = datExpr
+        self.MEs = MEs
+        self.sft = sft
+
+    def getModuleName(self):
+        """List of module colours (incl. grey), matching PyWGCNA.getModuleName."""
+        return list(self.datExpr.var['moduleColors'].dropna().unique())
+
+
+def _load_wgcna_result(name, expr_df, output_dir):
+    """Rebuild a :class:`_WGCNAResult` from an isolated group run's pickle."""
+    with open(os.path.join(output_dir, 'wgcna_result.pkl'), 'rb') as f:
+        result = pickle.load(f)
+    expr_genes = list(result['expr_genes'])
+    colors = pd.Series(result['moduleColors'], index=expr_genes,
+                       name='moduleColors')
+    # Align the expression to BOTH the genes and the samples WGCNA actually
+    # used (its pre-processing can drop outlier samples; kME correlates the
+    # per-gene expression vector with the eigengene, so equal lengths matter).
+    expr_w = expr_df.reindex(columns=expr_genes)
+    me_df = result['MEs']
+    if me_df is not None and len(me_df):
+        expr_w = expr_w.reindex(index=me_df.index)
+        if expr_w.isna().any().any():
+            print(f"  [{name}] WARNING: expression/MEs sample alignment after "
+                  f"WGCNA filtering has {int(expr_w.isna().sum().sum())} NaN — "
+                  f"kME for affected genes will be skipped.")
+    datExpr = _DatExprShim(colors, expr_genes, expr_w)
+    return _WGCNAResult(datExpr, me_df)
+
+
+def run_wgcna(name, expr_df, sample_info, output_dir, retries=1):
+    """Run PyWGCNA on one group in an ISOLATED subprocess.
+
+    PyWGCNA embeds R in the calling process, and running a SECOND large WGCNA
+    in the same embedded R session intermittently SIGSEGVs in WGCNA's C-level
+    connectivity code (``pickSoftThreshold``) — a native crash that cannot be
+    caught in Python.  Running each group in its own subprocess gives every
+    WGCNA a fresh R session (the first run in a fresh session always worked)
+    and lets a crash be contained + retried instead of killing the pipeline.
+
+    Returns a :class:`_WGCNAResult` shim exposing the attributes downstream
+    steps need (``.datExpr.var['moduleColors']``, ``.datExpr.var_names``,
+    ``.datExpr.to_df()``, ``.MEs``), or ``None`` if the group's WGCNA failed
+    after ``retries`` attempts.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    expr_pkl = os.path.join(output_dir, '_expr.pkl')
+    sinfo_pkl = os.path.join(output_dir, '_sinfo.pkl')
+    result_pkl = os.path.join(output_dir, 'wgcna_result.pkl')
+    with open(expr_pkl, 'wb') as f:
+        pickle.dump(expr_df, f)
+    with open(sinfo_pkl, 'wb') as f:
+        pickle.dump(sample_info, f)
+
+    cmd = [sys.executable, os.path.abspath(__file__), '--single-group',
+           name, expr_pkl, sinfo_pkl, output_dir]
+
+    ok = False
+    for attempt in range(retries + 1):
+        proc = subprocess.run(cmd)
+        if proc.returncode == 0:
+            ok = True
+            break
+        if proc.returncode == 2:
+            print(f"  [{name}] WGCNA skipped by subprocess "
+                  f"(degenerate / too few samples)")
+            break
+        print(f"  [{name}] WGCNA crashed (rc={proc.returncode}"
+              + (" SIGSEGV" if proc.returncode == -11 else "")
+              + f") — attempt {attempt + 1}/{retries + 1}")
+        if os.path.exists(result_pkl):
+            os.remove(result_pkl)
+
+    for p in (expr_pkl, sinfo_pkl):
+        if os.path.exists(p):
+            os.remove(p)
+
+    if not ok:
+        print(f"  [{name}] WGCNA FAILED after {retries + 1} attempt(s) — "
+              f"group marked failed")
+        return None
+    return _load_wgcna_result(name, expr_df, output_dir)
+
+
+def _run_wgcna_inner(name, expr_df, sample_info, output_dir):
+    """Run PyWGCNA on one group (in the CURRENT process). Returns WGCNA object.
+
+    This is the actual PyWGCNA execution.  It is invoked via subprocess
+    (see :func:`run_wgcna`) so every group gets a fresh embedded R session.
+    """
     from PyWGCNA.wgcna import WGCNA
 
     os.makedirs(output_dir, exist_ok=True)
@@ -366,54 +431,74 @@ def differential_expression_check(expr_a, expr_b, label_a, label_b,
 
 def module_preservation_both_ways(wgcna_a, wgcna_b, label_a, label_b,
                                   output_dir):
-    """Run compareNetworks with A as reference, then B as reference.
+    """Module-overlap preservation statistics between two groups' WGCNA modules.
 
-    Returns (pres_a_as_ref, pres_b_as_ref): each is a dict with keys
-    'jaccard_df', 'fraction_df', 'pvalue_df', and the Comparison object.
+    Pure-Python replacement for PyWGCNA's ``compareNetworks``: that API needs
+    the full R objects, which cannot be pickled out of the isolated WGCNA
+    subprocesses, and the pairwise module-overlap statistics it computes
+    (Jaccard similarity, overlap fraction, hypergeometric overlap p-value) are
+    trivially reproduced from the two groups' module assignments.
+
+    Returns the same dict shape the caller expects — ``{a_ref, b_ref}``, each
+    with ``jaccard`` / ``fraction`` / ``pvalue`` DataFrames whose rows/columns
+    are labelled ``{name}:{colour}``.  Jaccard and the hypergeometric p are
+    symmetric under a↔b transposition, so ``b_ref`` carries the same values;
+    the reverse direction is kept only for interface compatibility.  Heatmap
+    PDFs (cosmetic) are replaced by CSV exports of the two matrices.
     """
-    from PyWGCNA.utils import compareNetworks
+    colors_a = wgcna_a.datExpr.var['moduleColors']
+    colors_b = wgcna_b.datExpr.var['moduleColors']
+    universe = set(colors_a.index) & set(colors_b.index)
+
+    def module_sets(colors, genes):
+        out = {}
+        for g in genes:
+            c = colors.get(g)
+            if c is None or c == 'grey':
+                continue
+            out.setdefault(c, set()).add(g)
+        return out
+
+    mods_a = module_sets(colors_a, universe)
+    mods_b = module_sets(colors_b, universe)
+    n_universe = len(universe)
+
+    def overlap_frame(ref_label, test_label, ref_mods, test_mods):
+        rows = sorted(ref_mods)
+        cols = sorted(test_mods)
+        idx = [f'{ref_label}:{r}' for r in rows]
+        col_labels = [f'{test_label}:{c}' for c in cols]
+        jac = pd.DataFrame(0.0, index=idx, columns=col_labels)
+        frac = pd.DataFrame(0.0, index=idx, columns=col_labels)
+        pval = pd.DataFrame(1.0, index=idx, columns=col_labels)
+        for ra in rows:
+            a = ref_mods[ra]
+            for cb in cols:
+                b = test_mods[cb]
+                o = len(a & b)
+                jac.loc[f'{ref_label}:{ra}', f'{test_label}:{cb}'] = (
+                    o / (len(a) + len(b) - o) if (len(a) + len(b) - o) else 0.0)
+                frac.loc[f'{ref_label}:{ra}', f'{test_label}:{cb}'] = (
+                    o / len(b) if b else 0.0)
+                # upper-tail hypergeometric: P(overlap >= o | U, |a|, |b|)
+                pval.loc[f'{ref_label}:{ra}', f'{test_label}:{cb}'] = (
+                    _hypergeom_enrichment(o, len(b), n_universe, len(a)))
+        return jac, frac, pval
+
+    print(f"  Module preservation: {label_a} (ref) vs {label_b} (test) ...")
+    j_ab, frac_ab, p_ab = overlap_frame(label_a, label_b, mods_a, mods_b)
+    print(f"  Module preservation: {label_b} (ref) vs {label_a} (test) ...")
+    j_ba, frac_ba, p_ba = overlap_frame(label_b, label_a, mods_b, mods_a)
 
     os.makedirs(output_dir, exist_ok=True)
-
-    # --- A as reference, B as test ---
-    print(f"  Module preservation: {label_a} (ref) vs {label_b} (test) ...")
-    comp_ab = None
-    try:
-        comp_ab = compareNetworks([wgcna_a, wgcna_b])
-        comp_ab.compareNetworks()
-        comp_ab.plotHeatmapComparison(
-            color='coolwarm', row_cluster=True, col_cluster=True,
-            save=True, plot_format='pdf',
-            file_name=os.path.join(output_dir,
-                                   f'{label_a}_ref_{label_b}_test_heatmap'))
-    except BaseException as e:
-        print(f"    Preservation/heatmap failed: {e}")
-
-    # --- B as reference, A as test ---
-    print(f"  Module preservation: {label_b} (ref) vs {label_a} (test) ...")
-    comp_ba = None
-    try:
-        comp_ba = compareNetworks([wgcna_b, wgcna_a])
-        comp_ba.compareNetworks()
-        comp_ba.plotHeatmapComparison(
-            color='coolwarm', row_cluster=True, col_cluster=True,
-            save=True, plot_format='pdf',
-            file_name=os.path.join(output_dir,
-                                   f'{label_b}_ref_{label_a}_test_heatmap'))
-    except BaseException as e:
-        print(f"    Preservation/heatmap failed: {e}")
-
-    def _safe_attrs(comp):
-        if comp is None:
-            return {'jaccard': None, 'fraction': None, 'pvalue': None, 'comp': None}
-        return {'jaccard': comp.jaccard_similarity,
-                'fraction': comp.fraction,
-                'pvalue': comp.P_value,
-                'comp': comp}
+    j_ab.to_csv(os.path.join(output_dir, 'module_jaccard.csv'))
+    p_ab.to_csv(os.path.join(output_dir, 'module_pvalue.csv'))
 
     return {
-        'a_ref': _safe_attrs(comp_ab),
-        'b_ref': _safe_attrs(comp_ba),
+        'a_ref': {'jaccard': j_ab, 'fraction': frac_ab, 'pvalue': p_ab,
+                  'comp': None},
+        'b_ref': {'jaccard': j_ba, 'fraction': frac_ba, 'pvalue': p_ba,
+                  'comp': None},
     }
 
 
@@ -518,6 +603,21 @@ def eigengene_enrichment(wgcna_obj, gene_names, output_dir,
     # Get gene-to-module assignments
     module_colors_series = wgcna_obj.datExpr.var['moduleColors']
     expr_df = wgcna_obj.datExpr.to_df()  # samples × genes
+
+    # Persist the module→gene assignments so the VQ↔WGCNA gene-level overlap
+    # is reproducible after the run.  Previously only figure PDFs and
+    # enrichment terms were kept, and the per-group WGCNA dirs were empty on
+    # the volume — the module membership (datExpr.var['moduleColors']) lived
+    # only in the ephemeral container and was unreconstructable downstream.
+    module_genes_path = os.path.join(output_dir, 'module_genes.csv')
+    n_non_grey = int((module_colors_series != 'grey').sum())
+    with open(module_genes_path, 'w', newline='') as f:
+        wcsv = csv.writer(f)
+        wcsv.writerow(['gene', 'module_color'])
+        for gene, color in module_colors_series.items():
+            wcsv.writerow([gene, color])
+    print(f"  Saved {len(module_colors_series)} gene-module assignments "
+          f"({n_non_grey} non-grey) to {module_genes_path}")
 
     # Get eigengenes
     MEs = wgcna_obj.MEs  # samples × ME{color}
@@ -652,8 +752,6 @@ def compare_vq_vs_wgcna(matrices, gene_mappings, wgcna_objects,
     paradigm : str or None
         'sequential', 'joint', or None for backward-compat filename.
     """
-    from scipy.stats import fisher_exact
-
     os.makedirs(output_dir, exist_ok=True)
 
     vq_to_gene = gene_mappings['vq_to_gene']
@@ -713,13 +811,16 @@ def compare_vq_vs_wgcna(matrices, gene_mappings, wgcna_objects,
             if len(overlap) < 3:
                 continue
             jaccard = len(overlap) / len(vq_genes | wgcna_genes)
-            # Fisher exact
-            a = len(overlap)
-            b = len(vq_genes) - a
-            c = len(wgcna_genes) - a
-            d = n_universe - a - b - c
-            _, fisher_p = fisher_exact([[a, b], [c, d]],
-                                        alternative='greater')
+            # Upper-tail hypergeometric p (NOT Fisher's exact test): Fisher
+            # conditions on BOTH margins, so a fully-contained overlap (the
+            # VQ code contains the whole module — the STRONGEST enrichment)
+            # reports p=1.0 and no pair survives FDR.  Conditioning only on
+            # the module size and the background code size gives the strongest
+            # overlaps the tiny p they deserve.  Mirrors _hypergeom_enrichment
+            # used by the eigengene/cluster enrichments.  Column kept as
+            # 'fisher_p' for backward compatibility with consumers.
+            p_overlap = _hypergeom_enrichment(
+                len(overlap), len(wgcna_genes), n_universe, len(vq_genes))
             rows.append({
                 'vq_code': vq_code,
                 'wgcna_module': wgcna_key,
@@ -727,7 +828,7 @@ def compare_vq_vs_wgcna(matrices, gene_mappings, wgcna_objects,
                 'n_wgcna_genes': len(wgcna_genes),
                 'n_overlap': len(overlap),
                 'jaccard': round(jaccard, 4),
-                'fisher_p': round(float(fisher_p), 6),
+                'fisher_p': round(float(p_overlap), 6),
             })
 
     if rows:
@@ -946,10 +1047,10 @@ def compare_vq_wgcna_terms(vq_all_terms, wgcna_enrichment,
 def run_stratification_comparison(comparison_name, matrices, gene_names,
                                    gene_mappings, group_a_keys, group_b_keys,
                                    label_a, label_b, output_dir,
-                                   min_expression, top_n_genes,
                                    resolver=None, vq_csv_paths=None,
                                    paradigm_gms=None,
-                                   de_matrices=None, de_gene_names=None):
+                                   de_matrices=None, de_gene_names=None,
+                                   kme_top_n=100, jaccard_threshold=0.05):
     """Run the full WGCNA pipeline for one comparison.
 
     Steps:
@@ -986,9 +1087,11 @@ def run_stratification_comparison(comparison_name, matrices, gene_names,
     print(f"  {label_a}: {len(group_a_keys)} strata, {n_a} fish")
     print(f"  {label_b}: {len(group_b_keys)} strata, {n_b} fish")
 
-    if n_a < 8 or n_b < 8:
-        print(f"  SKIPPED: fewer than 8 fish per group "
-              f"(requires ≥8 for WGCNA)")
+    # Minimum matches the pipeline's min_fish=7 (a stratum is only built with
+    # >=7 fish), so a group is not printed as qualifying and then skipped.
+    if n_a < 7 or n_b < 7:
+        print(f"  SKIPPED: fewer than 7 fish per group "
+              f"(requires ≥7, matching the pipeline min_fish)")
         return None
 
     # 1. Build expression DataFrames
@@ -1025,7 +1128,8 @@ def run_stratification_comparison(comparison_name, matrices, gene_names,
 
     # 5. Identify preserved (consensus) modules
     preserved_colors, preserved_df = identify_preserved_modules(
-        preservation, label_a, label_b)
+        preservation, label_a, label_b,
+        jaccard_threshold=jaccard_threshold)
     if len(preserved_df) > 0:
         csv_path = os.path.join(pres_dir, 'preserved_modules.csv')
         preserved_df.to_csv(csv_path, index=False)
@@ -1035,9 +1139,11 @@ def run_stratification_comparison(comparison_name, matrices, gene_names,
     enrich_dir = os.path.join(output_dir, 'eigengene_enrichments')
     enrich_a = eigengene_enrichment(wgcna_a, gene_names,
                                      os.path.join(enrich_dir, label_a),
+                                     top_n_genes=kme_top_n,
                                      resolver=resolver)
     enrich_b = eigengene_enrichment(wgcna_b, gene_names,
                                      os.path.join(enrich_dir, label_b),
+                                     top_n_genes=kme_top_n,
                                      resolver=resolver)
 
     # 7 + 8. VQ vs WGCNA gene-set overlap + enrichment term comparison
@@ -1063,8 +1169,13 @@ def run_stratification_comparison(comparison_name, matrices, gene_names,
 
             # Step 8: VQ code GO enrichment
             term_dir = os.path.join(output_dir, 'vq_wgcna_term_comparison')
+            # The CSV gene_indices index into the FULL model gene array
+            # (gene_mappings['gene_names'], the set the VQ model was trained
+            # on), NOT the re-filtered WGCNA gene_names — using the shorter
+            # array here silently resolved the wrong gene symbols (and dropped
+            # any index >= its length), corrupting the g:Profiler queries.
             vq_terms = run_vq_enrichment_from_csv(
-                csv_path, gene_names, resolver, term_dir)
+                csv_path, gene_mappings['gene_names'], resolver, term_dir)
             if vq_terms:
                 n_vq_enriched += len(vq_terms)
                 term_df = compare_vq_wgcna_terms(
@@ -1149,11 +1260,13 @@ def main():
     parser = argparse.ArgumentParser(
         description='Comprehensive WGCNA with VQ comparison')
 
-    # Data
-    parser.add_argument('--matrices', required=True,
-                        help='Path to matrices.pkl')
-    parser.add_argument('--gene-mappings', required=True,
-                        help='Path to gene_mappings.pkl (for gene names + VQ data)')
+    # Data.  Not required=True: the --single-group mode (spawned by run_wgcna)
+    # needs neither — it reads an already-built expression DataFrame.
+    parser.add_argument('--matrices',
+                        help='Path to matrices.pkl (required for the main run)')
+    parser.add_argument('--gene-mappings',
+                        help='Path to gene_mappings.pkl (for gene names + VQ '
+                             'data; required for the main run)')
 
     # Output
     parser.add_argument('--output-dir', default='rol/output/wgcna',
@@ -1189,8 +1302,45 @@ def main():
                         help='Top N kME genes per module for enrichment')
     parser.add_argument('--preservation-jaccard', type=float, default=0.05,
                         help='Jaccard threshold for module preservation')
+    parser.add_argument('--single-group', nargs=4,
+                        metavar=('NAME', 'EXPR_PKL', 'SINFO_PKL', 'OUT_DIR'),
+                        help='Isolated single-group mode (invoked by run_wgcna '
+                             'via subprocess): run WGCNA for ONE group in this '
+                             'process with a fresh embedded R session and '
+                             'pickle the essential results.')
 
     args = parser.parse_args()
+
+    # --- Isolated single-group mode ---
+    # Each group's WGCNA runs in its own process so every PyWGCNA call gets a
+    # fresh embedded R session.  A second large WGCNA in one session SIGSEGVs
+    # in WGCNA's C connectivity code (pickSoftThreshold); isolation makes every
+    # group a "first run in a fresh session" (which always worked).
+    if args.single_group is not None:
+        name, expr_pkl, sinfo_pkl, out_dir = args.single_group
+        with open(expr_pkl, 'rb') as f:
+            expr_df = pickle.load(f)
+        with open(sinfo_pkl, 'rb') as f:
+            sample_info = pickle.load(f)
+        wgcna = _run_wgcna_inner(name, expr_df, sample_info, out_dir)
+        if wgcna is None:
+            sys.exit(2)
+        result = {
+            'expr_genes': list(wgcna.datExpr.var_names),
+            'moduleColors': list(wgcna.datExpr.var['moduleColors']),
+            'MEs': wgcna.MEs.copy(),
+        }
+        with open(os.path.join(out_dir, 'wgcna_result.pkl'), 'wb') as f:
+            pickle.dump(result, f)
+        print(f"[single-group] {name}: WGCNA complete — "
+              f"{len(result['expr_genes'])} genes")
+        sys.exit(0)
+
+    # Main (comparison) run: --matrices / --gene-mappings are mandatory.
+    if not args.matrices or not args.gene_mappings:
+        parser.error('--matrices and --gene-mappings are required for the '
+                     'main run (only --single-group skips them)')
+
     os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Load data ---
@@ -1231,14 +1381,32 @@ def main():
         print(f"  Note: {os.path.basename(other_mappings_path)} not found — "
               f"step 7 gene overlap will only cover {this_paradigm} paradigm")
 
-    # --- Gene filtering ---
-    # Keep the FULL unfiltered data for the differential-expression pre-check,
-    # which must not run on the already variance-filtered genes (circular).
+    # --- Gene set: INHERITED from the SURGE pipeline, not re-filtered ---
+    # The SURGE pipeline already selected the gene set (gene_mappings
+    # ['gene_names'] = the genes the VQ model was trained on) and saved
+    # matrices.pkl ALIGNED to it (columns == gene_names order).  WGCNA must
+    # run on EXACTLY that gene set for the SURGE-vs-WGCNA comparison to be
+    # apples-to-apples — any WGCNA-side re-filtering (the old
+    # filter_genes_two_stage, default top-5000) silently compared WGCNA on a
+    # DIFFERENT gene set.  The --top-n-genes/--min-expression flags here are
+    # therefore IGNORED.
     matrices_full = matrices
-    top_n = args.top_n_genes if args.top_n_genes > 0 else None
-    min_expr = args.min_expression if args.min_expression > 0 else 0.0
-    matrices, gene_names = filter_genes_two_stage(
-        matrices, gene_names_full, min_expression=min_expr, top_n=top_n)
+    gene_names = gene_names_full
+    if args.top_n_genes != 0 or args.min_expression > 0:
+        print("[wgcna] NOTE: --top-n-genes/--min-expression are ignored — the "
+              "gene set is inherited from the SURGE pipeline "
+              "(gene_mappings['gene_names'], "
+              f"{len(gene_names)} genes). Pass 0/0.0 to silence this.")
+
+    # Validate alignment: matrices columns must correspond 1:1 to gene_names.
+    sample_M = next(iter(matrices.values()))
+    if sample_M.shape[1] != len(gene_names):
+        raise ValueError(
+            f"[wgcna] matrices have {sample_M.shape[1]} columns but "
+            f"gene_mappings has {len(gene_names)} genes. matrices.pkl must be "
+            f"saved aligned to the model gene set — rerun the SURGE pipeline "
+            f"with the same --top-n-genes (the pipeline now persists the "
+            f"filtered matrices).")
 
     # Set up gene name resolver (TSV first, NCBI fallback)
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -1255,10 +1423,14 @@ def main():
     # --- Comparison 1: Infection ---
     if not args.skip_infection:
         yr = args.year
+        # Years may be int or float in the metadata ('(2021)' or '(2021.0)'),
+        # so the year part must be OPTIONALLY decimal — a strict `\.\d`
+        # matched nothing for integer-dtype Year columns and silently skipped
+        # every comparison (empty keys → n_a=0 < min → no-op).
         inf_keys = [k for k in matrices
-                    if re.search(rf'\({yr}\.\d\)-1$', str(k))]
+                    if re.search(rf'\({yr}(?:\.\d+)?\)-1$', str(k))]
         ninf_keys = [k for k in matrices
-                     if re.search(rf'\({yr}\.\d\)-0$', str(k))]
+                     if re.search(rf'\({yr}(?:\.\d+)?\)-0$', str(k))]
 
         vq_infection_csvs = resolve_vq_csvs(
             args.vq_figures_dir, 'infection_genes_for_go.csv')
@@ -1266,10 +1438,12 @@ def main():
             'infection', matrices, gene_names, gm,
             inf_keys, ninf_keys, 'infected', 'noninfected',
             os.path.join(args.output_dir, 'infection'),
-            args.min_expression, top_n, resolver=resolver,
+            resolver=resolver,
             vq_csv_paths=vq_infection_csvs,
             paradigm_gms=paradigm_gms,
-            de_matrices=matrices_full, de_gene_names=gene_names_full)
+            de_matrices=matrices_full, de_gene_names=gene_names_full,
+            kme_top_n=args.kme_top_n,
+            jaccard_threshold=args.preservation_jaccard)
         if res:
             results['infection'] = res
 
@@ -1277,9 +1451,9 @@ def main():
     if not args.skip_sex:
         yr = args.year
         f_keys = [k for k in matrices
-                  if re.search(rf'\({yr}\.\d\)-f$', str(k))]
+                  if re.search(rf'\({yr}(?:\.\d+)?\)-f$', str(k))]
         m_keys = [k for k in matrices
-                  if re.search(rf'\({yr}\.\d\)-m$', str(k))]
+                  if re.search(rf'\({yr}(?:\.\d+)?\)-m$', str(k))]
 
         vq_sex_csvs = resolve_vq_csvs(
             args.vq_figures_dir, 'sex_genes_for_go.csv')
@@ -1287,17 +1461,19 @@ def main():
             'sex', matrices, gene_names, gm,
             f_keys, m_keys, 'female', 'male',
             os.path.join(args.output_dir, 'sex'),
-            args.min_expression, top_n, resolver=resolver,
+            resolver=resolver,
             vq_csv_paths=vq_sex_csvs,
             paradigm_gms=paradigm_gms,
-            de_matrices=matrices_full, de_gene_names=gene_names_full)
+            de_matrices=matrices_full, de_gene_names=gene_names_full,
+            kme_top_n=args.kme_top_n,
+            jaccard_threshold=args.preservation_jaccard)
         if res:
             results['sex'] = res
 
     # --- Comparison 3: Year (per-lake earliest vs latest) ---
     if not args.skip_year:
         yl_keys = [k for k in matrices
-                   if (re.search(r'\(\d{4}\.\d\)$', str(k))
+                   if (re.search(r'\(\d{4}(?:\.\d+)?\)$', str(k))
                        and ')-' not in str(k)
                        and not str(k).endswith('-m')
                        and not str(k).endswith('-f'))]
@@ -1306,7 +1482,7 @@ def main():
         for k in yl_keys:
             s = str(k)
             lake = s.split(' (')[0]
-            yr_match = re.search(r'\((\d{4})\.\d\)', s)
+            yr_match = re.search(r'\((\d{4})(?:\.\d+)?\)', s)
             if yr_match:
                 yr = int(yr_match.group(1))
                 lake_year_counts.setdefault(lake, {})[yr] = matrices[k].shape[0]
@@ -1346,10 +1522,12 @@ def main():
                     keys_early, keys_late,
                     f'{lake}_{early}', f'{lake}_{late}',
                     os.path.join(args.output_dir, 'year', lake),
-                    args.min_expression, top_n, resolver=resolver,
+                    resolver=resolver,
                     paradigm_gms=paradigm_gms,
                     de_matrices=matrices_full,
-                    de_gene_names=gene_names_full)
+                    de_gene_names=gene_names_full,
+                    kme_top_n=args.kme_top_n,
+                    jaccard_threshold=args.preservation_jaccard)
                 if res:
                     results[comparison] = res
 

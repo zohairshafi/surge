@@ -6,10 +6,12 @@ across fish (centered + scaled), then the gene-gene adjacency is:
     adj = Mz.T @ Mz
 
 Because the z-scored matrix has zero mean per gene, this Gram matrix is
-proportional to the Pearson correlation matrix of the genes (up to the n-1
-scale factor), is symmetric positive semi-definite, and CAN be negative
-between anti-correlated genes — unlike the previous uncentered ``M.T @ M``,
-which was dominated by mean abundance and could never express anti-correlation.
+proportional to the Pearson correlation matrix of the genes (n_fish × ρ with
+np.std's default ddof=0; the constant scale factor is removed downstream by
+min-max scaling before binarization), is symmetric positive semi-definite,
+and CAN be negative between anti-correlated genes — unlike the previous
+uncentered ``M.T @ M``, which was dominated by mean abundance and could never
+express anti-correlation.
 
 The adjacency is then decomposed via eigendecomposition, reconstructed at multiple
 scales (k = 4, 8, 32, 64, 127 components), binarized at a per-level
@@ -33,6 +35,15 @@ import torch
 from scipy.sparse.linalg import eigsh
 from torch_geometric.data import Data
 from tqdm import tqdm
+
+
+# Version of the adjacency construction method.  Bumped whenever
+# _compute_adjacency's math changes (CLR/z-score/zero-replacement etc.) so the
+# graph-bundle cache key invalidates and stale pre-change bundles are never
+# served as valid.  Without this, two runs that produce different adjacency
+# matrices but identical (n_eigencomponents, reconstruction_levels,
+# target_density) would silently reuse each other's graphs.
+ADJACENCY_METHOD_VERSION = 'clr-zscore-v1'
 
 
 class CoexpressionGraphBuilder:
@@ -156,75 +167,76 @@ class CoexpressionGraphBuilder:
                                   device=self.device)
         return Data(edge_index=edge_index, num_nodes=n_genes)
 
-    def build_spectral(self, expression_matrix, k=64, target_density=None):
-        """
-        Build a single spectrally-reconstructed graph at k eigencomponents.
+# DEAD CODE (commented out): CoexpressionGraphBuilder.build_spectral (never called)
+#    def build_spectral(self, expression_matrix, k=64, target_density=None):
+#        """
+#        Build a single spectrally-reconstructed graph at k eigencomponents.
 
-        Unlike ``build_fast`` which thresholds the raw adjacency directly
-        (producing dense ~65% graphs), this method performs eigendecomposition
-        and reconstructs at a single k-component level — matching the
-        reconstruction methodology used for the real (non-permuted) graphs.
+#        Unlike ``build_fast`` which thresholds the raw adjacency directly
+#        (producing dense ~65% graphs), this method performs eigendecomposition
+#        and reconstructs at a single k-component level — matching the
+#        reconstruction methodology used for the real (non-permuted) graphs.
 
-        Parameters
-        ----------
-        expression_matrix : np.ndarray (n_fish, n_genes)
-        k : int
-            Number of eigencomponents for reconstruction.
-        target_density : float or None
-            If provided, binarize at a percentile threshold that yields this
-            exact edge density rather than thresholding at the mean.  Used to
-            density-match permuted graphs to their real counterparts so the
-            null distribution is not confounded by density differences.
+#        Parameters
+#        ----------
+#        expression_matrix : np.ndarray (n_fish, n_genes)
+#        k : int
+#            Number of eigencomponents for reconstruction.
+#        target_density : float or None
+#            If provided, binarize at a percentile threshold that yields this
+#            exact edge density rather than thresholding at the mean.  Used to
+#            density-match permuted graphs to their real counterparts so the
+#            null distribution is not confounded by density differences.
 
-        Returns a single Data, or None if degenerate.
-        """
-        adj = self._compute_adjacency(expression_matrix)
-        n_genes = adj.shape[0]
-        k_actual = min(k, self.n_eigencomponents, n_genes - 2)
-        if k_actual <= 0:
-            return None
+#        Returns a single Data, or None if degenerate.
+#        """
+#        adj = self._compute_adjacency(expression_matrix)
+#        n_genes = adj.shape[0]
+#        k_actual = min(k, self.n_eigencomponents, n_genes - 2)
+#        if k_actual <= 0:
+#            return None
 
-        eigvals, eigvecs = self._eigendecompose(adj)
-        del adj  # free ~6.3 GB
+#        eigvals, eigvecs = self._eigendecompose(adj)
+#        del adj  # free ~6.3 GB
 
-        V_k = eigvecs[:, :k_actual]
-        S_k = np.diag(eigvals[:k_actual])
-        recon = V_k @ S_k @ V_k.T
+#        V_k = eigvecs[:, :k_actual]
+#        S_k = np.diag(eigvals[:k_actual])
+#        recon = V_k @ S_k @ V_k.T
 
         # Min-max scale in-place
-        if np.iscomplexobj(recon):
-            recon = recon.real
-        r_min, r_max = recon.min(), recon.max()
-        if r_max > r_min:
-            recon -= r_min
-            recon /= (r_max - r_min)
+#        if np.iscomplexobj(recon):
+#            recon = recon.real
+#        r_min, r_max = recon.min(), recon.max()
+#        if r_max > r_min:
+#            recon -= r_min
+#            recon /= (r_max - r_min)
 
         # Binarize: density-matched percentile or default mean threshold
-        if target_density is not None:
+#        if target_density is not None:
             # Use exact quantile — histogram bins are too coarse when the
             # permuted reconstruction has a highly skewed value distribution
             # (most values near 0 after shuffling destroys co-expression).
-            threshold = float(np.quantile(recon, 1.0 - target_density))
-        else:
-            threshold = float(np.mean(recon))
+#            threshold = float(np.quantile(recon, 1.0 - target_density))
+#        else:
+#            threshold = float(np.mean(recon))
 
-        binary_adj = recon >= threshold
-        del recon
-        np.fill_diagonal(binary_adj, False)
+#        binary_adj = recon >= threshold
+#        del recon
+#        np.fill_diagonal(binary_adj, False)
 
-        max_edges = n_genes * (n_genes - 1)
-        n_edges = int(np.sum(binary_adj))
-        density = n_edges / max_edges if max_edges > 0 else 0.0
-        if density == 0.0 or density > 0.999:
-            print(f"  build_spectral k={k_actual}: density={density:.4%} — degenerate, skipping")
-            return None
+#        max_edges = n_genes * (n_genes - 1)
+#        n_edges = int(np.sum(binary_adj))
+#        density = n_edges / max_edges if max_edges > 0 else 0.0
+#        if density == 0.0 or density > 0.999:
+#            print(f"  build_spectral k={k_actual}: density={density:.4%} — degenerate, skipping")
+#            return None
 
-        rows, cols = np.where(binary_adj)
-        tag = " (density-matched)" if target_density is not None else ""
-        print(f"  build_spectral k={k_actual}: {n_edges:,} edges ({density:.2%}){tag}")
-        edge_index = torch.tensor(np.vstack([rows, cols]), dtype=torch.long,
-                                  device=self.device)
-        return Data(edge_index=edge_index, num_nodes=n_genes)
+#        rows, cols = np.where(binary_adj)
+#        tag = " (density-matched)" if target_density is not None else ""
+#        print(f"  build_spectral k={k_actual}: {n_edges:,} edges ({density:.2%}){tag}")
+#        edge_index = torch.tensor(np.vstack([rows, cols]), dtype=torch.long,
+#                                  device=self.device)
+#        return Data(edge_index=edge_index, num_nodes=n_genes)
 
     # ------------------------------------------------------------------
     # Step 1: Gene co-expression adjacency
@@ -246,12 +258,12 @@ class CoexpressionGraphBuilder:
         apples.  (The earlier code z-scored raw relative abundance, whose
         unit-sum constraint distorted every correlation.)
 
-        Because genes are centered after CLR, adj[i, j] is the (n-1)-scaled
-        Pearson correlation between genes i and j: symmetric PSD, and NEGATIVE
-        for anti-correlated genes.  Returns the raw Gram matrix (NOT min-max
-        scaled): min-max scaling here would break the PSD property that
-        _eigendecompose relies on, and every downstream reconstruction is
-        rescaled internally before binarization anyway.
+        Because genes are centered after CLR, adj[i, j] is the n_fish-scaled
+        Pearson correlation between genes i and j (np.std uses ddof=0):
+        symmetric PSD, and NEGATIVE for anti-correlated genes.  Returns the
+        raw Gram matrix (NOT min-max scaled): min-max scaling here would break
+        the PSD property that _eigendecompose relies on, and every downstream
+        reconstruction is rescaled internally before binarization anyway.
         """
         M = np.asarray(M, dtype=np.float32)
         if M.ndim != 2 or M.shape[0] < 2:
@@ -348,6 +360,34 @@ class CoexpressionGraphBuilder:
         edge_counts = []
         max_edges = n_genes * (n_genes - 1)
         n_levels = 0
+        _capped_warned = False
+
+        # ---- Per-level marginal spectral-mass weights (principled
+        #      multi-scale weighting).  Each reconstruction level i is weighted
+        #      by the fraction of total spectral variance in the eigen-
+        #      directions that level ADDS beyond the previous level:
+        #          w_i = (sum_{j=k_{i-1}+1}^{k_i} lambda_j^2) / (sum_j lambda_j^2)
+        #      Because the spectrum decays fast, higher-k levels add little new
+        #      mass and are down-weighted automatically (they mostly re-express
+        #      already-captured structure or add noise-floor eigen-directions).
+        #      Normalized so the FIRST built level keeps weight 1.0 — matching
+        #      the previous schedule's level-1 weight and preserving the
+        #      edge-vs-commit loss balance — while the denser levels are
+        #      attenuated relative to it.  Falls back to 1/(i+1) if the
+        #      spectrum is degenerate (total mass == 0).
+        eigvals_sq = np.square(eigvals)
+        total_mass = float(eigvals_sq.sum())
+        _built_ks = [k for k in self.reconstruction_levels
+                     if k <= eigvecs.shape[1]]
+        _prev_k = 0
+        level_weights = []
+        for _k in _built_ks:
+            _marginal = ((float(eigvals_sq[_prev_k:_k].sum()) / total_mass)
+                         if total_mass > 0 else 1.0)
+            level_weights.append(_marginal)
+            _prev_k = _k
+        if level_weights and level_weights[0] > 0:
+            level_weights = [w / level_weights[0] for w in level_weights]
 
         for k in tqdm(self.reconstruction_levels, desc="Reconstructing graphs"):
             if k > eigvecs.shape[1]:
@@ -371,6 +411,19 @@ class CoexpressionGraphBuilder:
             if target_density is not None:
                 level_density = min(target_density + n_levels * 0.01, 0.05)
                 threshold = float(np.quantile(recon, 1.0 - level_density))
+                # Alignment check: level i (0-based) is weighted 1/(i+1) in the
+                # training loss, which assumes its edge density is (i+1)*target
+                # (1% → 2% → …).  The 5% cap breaks that for levels past the
+                # ramp — flag it loudly once instead of silently mis-aligning
+                # the loss weight with the edge density.
+                ideal_density = target_density * (n_levels + 1)
+                if (not _capped_warned and level_density < ideal_density - 1e-9):
+                    print(f"  WARNING: reconstruction level {n_levels + 1} "
+                          f"(k={k}) density capped at {level_density:.1%} "
+                          f"(ideal {ideal_density:.1%}) — the 1/(i+1) loss "
+                          f"weight assumes density ramps (i+1)%; alignment "
+                          f"breaks from this level onward.")
+                    _capped_warned = True
             else:
                 threshold = float(np.mean(recon))
             # Inclusive threshold: strict '>' undershoots the target density
@@ -386,9 +439,16 @@ class CoexpressionGraphBuilder:
             # Store target as bool (791 MB vs 3.1 GB for float32).
             # reconstruction_loss handles bool correctly (float32 - bool → float32).
             target_adj = torch.tensor(binary_adj)
+            # Principled multi-scale weight for this level: the marginal
+            # spectral mass it adds, normalized so the first level is 1.0.
+            # Training loaders read g.recon_weight and fall back to 1/(i+1)
+            # when it is absent (old bundles).
+            _w = (level_weights[n_levels] if n_levels < len(level_weights)
+                  else 1.0 / (n_levels + 1))
             sparse_graphs.append(Data(edge_index=edge_index,
                                       target_adj=target_adj,
-                                      num_nodes=n_genes))
+                                      num_nodes=n_genes,
+                                      recon_weight=_w))
 
             # ---- Radii contribution (in-place on recon, destroys it) ----
             # Compute per_gene = 1.0 - mean(|2*recon - 1.0|, axis=1)
@@ -519,7 +579,8 @@ class CoexpressionGraphBuilder:
         it silently served stale bundles when the density target changed.
         """
         import hashlib
-        payload = (f"{n_eigencomponents}|{'_'.join(map(str, reconstruction_levels))}"
+        payload = (f"method={ADJACENCY_METHOD_VERSION}|"
+                   f"{n_eigencomponents}|{'_'.join(map(str, reconstruction_levels))}"
                    f"|target_density={target_density}")
         return hashlib.md5(payload.encode()).hexdigest()[:8]
 
@@ -553,7 +614,14 @@ class CoexpressionGraphBuilder:
             print(f"  Bundle unusable: key mismatch ({stored_key} != {key})")
             return False
         stored_hash = payload.get('config_hash', '')
-        if stored_hash and stored_hash != expected_config_hash:
+        if not stored_hash:
+            # Bundles without a config_hash predate hash validation — they may
+            # have been built with a DIFFERENT adjacency method (e.g. before
+            # the CLR/z-score change) and must not be trusted as reusable.
+            print("  Bundle unusable: missing config_hash (built before cache "
+                  "validation; refusing stale reuse)")
+            return False
+        if stored_hash != expected_config_hash:
             print(f"  Bundle unusable: config hash mismatch "
                   f"({stored_hash} != {expected_config_hash})")
             return False

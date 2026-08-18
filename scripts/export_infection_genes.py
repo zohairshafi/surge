@@ -164,9 +164,14 @@ def main():
 
     with open(out_path, 'w', newline='') as f:
         writer = csv.writer(f)
+        # gene_indices MUST be present and aligned with gene_names: consumers
+        # (vq_gprofiler.py / wgcna_pipeline.py run_vq_enrichment_from_csv)
+        # resolve gene lists from the gene_indices column.  Without it, every
+        # code resolves to 0 named genes and the VQ enrichment is silently
+        # empty.  Mirror pipeline.py step 9's schema.
         writer.writerow(['vq_code', 'p_value', 'q_value', 'fold_change',
                          'infected_mean', 'noninfected_mean',
-                         'n_genes', 'gene_names'])
+                         'n_genes', 'gene_indices', 'gene_names'])
 
         for code, r in sig_codes:
             genes = set()
@@ -174,8 +179,10 @@ def main():
                 if code in v2g:
                     genes.update(v2g[code])
 
+            gene_idx_list = []
             gene_name_list = []
             for g in sorted(genes)[:args.max_genes_per_code]:
+                gene_idx_list.append(g)
                 if gene_names and g < len(gene_names):
                     gene_name_list.append(gene_names[g])
                 else:
@@ -189,6 +196,7 @@ def main():
                 f"{r['infected_mean']:.6f}",
                 f"{r['noninfected_mean']:.6f}",
                 len(genes),
+                ';'.join(str(g) for g in gene_idx_list),
                 ';'.join(gene_name_list),
             ])
 

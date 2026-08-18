@@ -38,7 +38,17 @@ def main():
                         help='Pipeline output directory')
     args = parser.parse_args()
 
-    strats = ["year_lake", "sex_year_lake", "infection_year_lake"]
+    # Panels: (strat, suffix, label).  year_lake gets one lake-level panel;
+    # sex/infection get one panel PER status, since the per-lake temporal
+    # series is only well-defined within a single status (suffixed keys
+    # 'Lake (2021)-f' / '-m' collide at (lake, year) if merged).
+    panels = (
+        [("year_lake", None, "year_lake")]
+        + [(s, suf, f"{s} ({suf.lstrip('-')})")
+           for s, sufs in (("sex_year_lake", ["-f", "-m"]),
+                           ("infection_year_lake", ["-0", "-1"]))
+           for suf in sufs]
+    )
     colors = {"Source": "#2196F3", "Recipient": "#F44336"}
     jitter = 0.08
     rng = np.random.default_rng(42)
@@ -64,22 +74,19 @@ def main():
                     if os.path.exists(cb_path) else None)
         analyzer = LakeAnalyzer(emb, data=MockData(), codebook=codebook)
 
-        fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-
-        for ax, strat in zip(axes, strats):
+        def _draw_panel(ax, strat, suffix, label):
+            """Draw one Source/Recipient endpoint panel for a (strat, suffix)."""
             sub = analyzer.for_stratification(strat)
-            # wasserstein_temporal now raises for suffixed-only stratifications
-            # (sex/infection), whose per-lake temporal series is undefined when
-            # 'Lake (2021)-f' and 'Lake (2021)-m' collide per (lake, year).
-            # Previously these panels silently mixed / overwrote strata.
+            # wasserstein_temporal raises for suffixed-only stratifications
+            # without a suffix (sex/infection), whose per-lake temporal series
+            # is undefined when 'Lake (2021)-f' and 'Lake (2021)-m' collide per
+            # (lake, year).  With a suffix it builds the per-status series.
             try:
-                wass = sub.wasserstein_temporal(base_year=2019)
+                wass = sub.wasserstein_temporal(base_year=2019, suffix=suffix)
             except ValueError as exc:
-                print(f"  [temporal_summary] Stratification '{strat}' skipped: "
-                      f"{exc}")
-                ax.set_title(f"{strat}\n(skipped: no unambiguous per-lake "
-                             f"temporal series)", fontsize=9)
-                continue
+                print(f"  [temporal_summary] '{label}' skipped: {exc}")
+                ax.set_title(f"{label}\n(skipped)", fontsize=8)
+                return
             wass_scaled, p95 = LakeAnalyzer.scale_wasserstein_p95(wass)
 
             src_vals, rec_vals = [], []
@@ -102,13 +109,13 @@ def main():
                     rec_vals.append(endpoint)
                     rec_names.append(lake)
             if unclassified:
-                print(f"  [temporal_summary] {strat}: {len(unclassified)} "
+                print(f"  [temporal_summary] {label}: {len(unclassified)} "
                       f"lake(s) not in the hardcoded role map and dropped: "
                       f"{', '.join(sorted(unclassified))}")
             if last_years:
                 distinct_last = sorted(set(last_years))
                 if len(distinct_last) > 1:
-                    print(f"  [temporal_summary] {strat}: WARNING — lakes were "
+                    print(f"  [temporal_summary] {label}: WARNING — lakes were "
                           f"last sampled in DIFFERENT years "
                           f"({distinct_last}); endpoint divergence compares "
                           f"lakes at unequal time horizons.")
@@ -135,12 +142,12 @@ def main():
             # De-conflict labels: sort by y, stagger offsets for close neighbours
             labelled.sort(key=lambda t: t[1])
             offsets = [0, -6, 6, -10, 10, -14, 14]  # cycling stagger distances
-            for i, (x, val, label, side) in enumerate(labelled):
+            for i, (x, val, lab, side) in enumerate(labelled):
                 # Check how many previous labels are close in y
                 n_nearby = sum(1 for j in range(i)
                                if abs(labelled[j][1] - val) < 0.03)
                 y_off = offsets[min(n_nearby, len(offsets) - 1)]
-                ax.annotate(label, (x, val), fontsize=6, alpha=0.8,
+                ax.annotate(lab, (x, val), fontsize=6, alpha=0.8,
                             xytext=(15, y_off), textcoords="offset points",
                             va='center')
 
@@ -153,20 +160,28 @@ def main():
             if len(src_vals) >= 2 and len(rec_vals) >= 2:
                 t_s, t_p = ttest_ind(src_vals, rec_vals)
                 mw_s, mw_p = mannwhitneyu(src_vals, rec_vals)
-                d = (np.mean(src_vals) - np.mean(rec_vals)) / np.sqrt(
+                pooled_sd = np.sqrt(
                     (np.std(src_vals, ddof=1)**2 +
                      np.std(rec_vals, ddof=1)**2) / 2)
+                # Degenerate groups (all-equal values → pooled SD == 0) make
+                # Cohen's d undefined; report NaN rather than 0/0 or inf.
+                d = ((np.mean(src_vals) - np.mean(rec_vals)) / pooled_sd
+                     if pooled_sd > 0 else float('nan'))
                 ax.set_title(
-                    f"{strat}\nd = {d:.2f},  "
-                    f"t-test p = {t_p:.3f},  MW p = {mw_p:.3f}", fontsize=9)
+                    f"{label}\nd = {d:.2f},  "
+                    f"t-test p = {t_p:.3f},  MW p = {mw_p:.3f}", fontsize=8)
             else:
-                ax.set_title(strat, fontsize=10)
+                ax.set_title(label, fontsize=9)
 
             ax.set_xticks([0, 1])
             ax.set_xticklabels(["Source", "Recipient"])
             ax.set_ylabel("P95-scaled Wasserstein distance\nfrom baseline")
             ax.set_ylim(bottom=-0.05)
             ax.grid(axis="y", alpha=0.3)
+
+        fig, axes = plt.subplots(1, len(panels), figsize=(len(panels) * 4.8, 5))
+        for ax, (strat, suffix, label) in zip(axes, panels):
+            _draw_panel(ax, strat, suffix, label)
 
         fig.suptitle(
             f"Temporal Divergence by Experimental Role — {paradigm} training",
@@ -181,9 +196,9 @@ def main():
         print(f"  Saved {out_path}")
 
         # Print stats
-        for strat in strats:
+        for strat, suffix, label in panels:
             sub = analyzer.for_stratification(strat)
-            wass = sub.wasserstein_temporal_or_skip(base_year=2019)
+            wass = sub.wasserstein_temporal_or_skip(base_year=2019, suffix=suffix)
             wass_scaled, _ = LakeAnalyzer.scale_wasserstein_p95(wass)
             sv, rv = [], []
             for lake, dists in wass_scaled.items():
@@ -194,12 +209,14 @@ def main():
             if len(sv) >= 2 and len(rv) >= 2:
                 t_s, t_p = ttest_ind(sv, rv)
                 mw_s, mw_p = mannwhitneyu(sv, rv)
-                d = (np.mean(sv) - np.mean(rv)) / np.sqrt(
+                pooled_sd = np.sqrt(
                     (np.std(sv, ddof=1)**2 + np.std(rv, ddof=1)**2) / 2)
-                print(f"    {strat}: S={np.mean(sv):.3f} vs R={np.mean(rv):.3f}, "
+                d = ((np.mean(sv) - np.mean(rv)) / pooled_sd
+                     if pooled_sd > 0 else float('nan'))
+                print(f"    {label}: S={np.mean(sv):.3f} vs R={np.mean(rv):.3f}, "
                       f"d={d:.2f}, t-test p={t_p:.3f}, MW p={mw_p:.3f}")
             else:
-                print(f"    {strat}: insufficient data")
+                print(f"    {label}: insufficient data")
 
 
 if __name__ == "__main__":

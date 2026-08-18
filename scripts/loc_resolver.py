@@ -148,9 +148,12 @@ class GeneNameResolver:
                 continue
 
             # 2. NCBI JSON cache
-            cached = self._ncbi_cache.get(clean)
-            if cached is not None:
-                resolved.append(cached)  # may be None
+            # Membership test, not `.get()`: a cached None means "confirmed
+            # unresolvable" and MUST be treated as a hit — otherwise every
+            # doomed LOC gene is re-queried (mygene.info + NCBI Entrez, ~0.35 s
+            # each) on every resolve_many call across all modules/codes.
+            if clean in self._ncbi_cache:
+                resolved.append(self._ncbi_cache[clean])  # may be None
                 continue
 
             # Needs further resolution

@@ -87,7 +87,13 @@ class VQGNN(nn.Module):
 
         # Vector quantization layer (from pip package, not vqgraph submodule).
         # Anti-collapse measures: k-means init, dead-code revival, lower-dim
-        # codebook (Improved VQGAN), orthogonal regularisation, faster EMA.
+        # codebook (Improved VQGAN), codebook-diversity (entropy) regularizer,
+        # faster EMA.  The orthogonal regularizer is DISABLED (was 5): it
+        # inflated the returned commit_loss ~6x and fought the diversity term;
+        # commit_alpha in the training loop now scales a clean commitment
+        # signal.  codebook_diversity_loss_weight=1.0 adds a negative-entropy
+        # term on the codebook usage distribution, directly penalizing
+        # collapse (lucidrains' standard remedy for dead codes).
         self.vq = VectorQuantize(
             dim=codebook_channels,
             codebook_size=codebook_size,
@@ -96,8 +102,9 @@ class VQGNN(nn.Module):
             kmeans_init=True,
             kmeans_iters=20,
             threshold_ema_dead_code=2,
-            orthogonal_reg_weight=5,
+            orthogonal_reg_weight=0.0,
             orthogonal_reg_active_codes_only=True,
+            codebook_diversity_loss_weight=1.0,
             decay=0.7,
         )
 
@@ -153,12 +160,11 @@ class VQGNN(nn.Module):
         indices : torch.Tensor (n_nodes,)
             VQ code assignment for each gene.
         commit_loss : torch.Tensor (scalar)
-            Loss returned by the VectorQuantize layer.  NOTE: this is
-            ``commitment_loss + orthogonal_reg_weight * orthogonal_loss``
-            (orthogonal_reg_weight=5 here), NOT the bare commitment loss.
-            It is therefore larger than a raw commitment loss, and the
-            best-epoch criterion and logs that use it are inflated by the
-            orthogonal-regularization term.
+            Loss returned by the VectorQuantize layer.  With the orthogonal
+            regularizer disabled this is ``codebook_update_loss +
+            commitment_weight * commitment_loss + codebook_diversity_loss_weight
+            * diversity_loss`` — the commitment signal is no longer inflated by
+            the orthogonal-regularization term.
         """
         x = self.node_emb.weight
         # nn.Embedding is excluded from AMP autocast per PyTorch policy, so the
@@ -171,10 +177,10 @@ class VQGNN(nn.Module):
         for conv in self.convs[:-1]:
             x = conv(x, edge_index)
             # Radii noise is a TRAINING-ONLY data augmentation.  Gating on
-            # self.training makes eval-time forwards (get_vq_assignments /
-            # get_codebook_histogram) deterministic and consistent — without
-            # the guard, any eval call passing radii produced a different
-            # code assignment every run because of torch.randn_like.
+            # self.training keeps eval-time forwards (get_vq_assignments /
+            # get_codebook_histogram) deterministic — without the guard, any
+            # eval call passing radii would produce a different code
+            # assignment every run because of torch.randn_like.
             if radii is not None and self.training:
                 radii_t = radii.to(device=x.device, dtype=x.dtype)
                 if radii_t.dim() == 1:
@@ -218,9 +224,10 @@ class VQGNN(nn.Module):
     # Loss
     # ------------------------------------------------------------------
 
-    def reconstruction_loss(self, decoded, target_adj, batch_size=1024):
+    def reconstruction_loss(self, decoded, target_adj, batch_size=1024,
+                            class_balanced=True):
         """
-        Mean-squared error between decoded·decoded.T and the target adjacency,
+        Class-balanced MSE between decoded·decoded.T and the target adjacency,
         evaluated in blocks to keep GPU memory bounded at O(batch_size × N).
 
         The inner-product matrix is passed through a sigmoid to map from
@@ -233,14 +240,25 @@ class VQGNN(nn.Module):
         decoded : torch.Tensor (N, D)
             Decoded node representations.
         target_adj : torch.Tensor (N, N)
-            Dense target adjacency matrix. Values in [0, 1].
+            Dense target adjacency matrix. Values in {0, 1}.
         batch_size : int
             Number of rows to process at once.
+        class_balanced : bool
+            Weight the 'edge present' (1) and 'no edge' (0) classes inversely
+            to their frequencies.  An adjacency at ~1% density is ~99% zeros,
+            so an unweighted MSE is dominated by 'predict 0' and the model
+            never learns to fire edges — the VQ codebook collapses because the
+            reconstruction gives it no signal to differentiate.  With this on,
+            a missed edge (false negative) costs ~p_neg/p_pos ≈ 99× more than a
+            spurious edge (false positive), which is what forces the codebook
+            to actually carve out edge-bearing structure.  Weights are
+            normalized so the expected mean weight is 1, preserving the loss
+            scale and the recon_weight / commit_alpha balance.
 
         Returns
         -------
         mse : torch.Tensor (scalar)
-            Mean squared error over OFF-DIAGONAL entries.
+            (Weighted) mean squared error over OFF-DIAGONAL entries.
 
         Notes
         -----
@@ -268,6 +286,17 @@ class VQGNN(nn.Module):
                 device=device, dtype=torch.float32)         # (B, N) on GPU
 
             sq = (recon - tgt).pow(2)
+            if class_balanced:
+                # Per-block class frequencies (the ~1% density is uniform
+                # across rows, so a 1024×N block estimates it well).
+                n_tot = tgt.numel()
+                n_pos = tgt.sum()
+                n_neg = n_tot - n_pos
+                eps = 1e-6
+                # w_pos ≈ 50, w_neg ≈ 0.5 at 1% density; mean weight = 1.
+                w_pos = 0.5 / (n_pos / n_tot + eps)
+                w_neg = 0.5 / (n_neg / n_tot + eps)
+                sq = sq * (tgt * w_pos + (1.0 - tgt) * w_neg)
             # Mask the diagonal: row-local positions (j, start+j).
             if end > start:
                 diag_pos = torch.arange(end - start, device=device)
@@ -275,6 +304,14 @@ class VQGNN(nn.Module):
             losses.append(sq.sum())
             n_entries += sq.numel() - (end - start)
 
+        if n_entries == 0:
+            # A 1-node graph has no off-diagonal entries at all (every entry
+            # is the masked diagonal) — the loss is undefined, not 0.  Return
+            # a zero scalar so a degenerate graph can't inject NaN into the
+            # shared weights (loss.backward() on NaN would corrupt training).
+            print("  [reconstruction_loss] no off-diagonal entries "
+                  "(n_nodes <= 1) — returning zero loss.")
+            return torch.zeros((), device=device)
         return torch.stack(losses).sum() / n_entries
 
     # ------------------------------------------------------------------
@@ -283,7 +320,7 @@ class VQGNN(nn.Module):
 
     def train_joint(self, model_save_path, list_of_edge_indices,
                     list_of_target_adjs, epochs=5, lr=1e-4,
-                    commit_alpha=0.25, radii=None, lake_ids=None,
+                    commit_alpha=0.5, radii=None, lake_ids=None,
                     recon_weights=None):
         """
         Joint training with lake-identity conditioning.
@@ -372,6 +409,9 @@ class VQGNN(nn.Module):
         for ep in range(epochs):
             # Shuffle lake order so no lake is systematically advantaged
             perm = np.random.permutation(n_graphs)
+            # Per-epoch codebook-utilization accumulator (nearly free — the
+            # forward pass already computes indices, we just stop discarding them).
+            usage = torch.zeros(self.vq.codebook_size, dtype=torch.long)
             ep_losses = []
             ep_edge_losses = []
             ep_commit_losses = []
@@ -400,10 +440,11 @@ class VQGNN(nn.Module):
                 # half the memory for the (E, in_channels) SAGEConv gather.
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16,
                                         enabled=use_amp):
-                    _, decoded, _, _, commit_loss = self.forward(
+                    _, decoded, _, indices, commit_loss = self.forward(
                         edge_index, radii=r, lake_idx=lake_idx,
                     )
                     edge_loss = self.reconstruction_loss(decoded, target_adj)
+                usage += self.codebook_usage(indices)
                 loss = w * edge_loss + commit_alpha * commit_loss
 
                 optimizer.zero_grad()
@@ -445,6 +486,7 @@ class VQGNN(nn.Module):
                   f"max={np.max(ep_losses):.4f} | "
                   f"edge={np.mean(ep_edge_losses):.4f} "
                   f"commit={np.mean(ep_commit_losses):.4f}{best_str}")
+            print("    " + self.format_codebook_usage(usage, 'joint'))
 
         # Restore the best epoch into the model and save it as the checkpoint,
         # so downstream steps reflect the best epoch rather than the final one.
@@ -511,3 +553,38 @@ class VQGNN(nn.Module):
         hist = torch.bincount(indices, minlength=self.vq.codebook_size).float()
         hist = hist / hist.sum()
         return hist
+
+    def codebook_usage(self, indices):
+        """Per-graph code-usage counts (length = codebook_size) from the VQ
+        ``indices`` already returned by :meth:`forward`.
+
+        Accumulate these across an epoch and call :meth:`format_codebook_usage`
+        to report utilization.  This is nearly free at train time — the forward
+        pass computes ``indices`` anyway; we were previously discarding them.
+        """
+        return torch.bincount(indices.reshape(-1).cpu(),
+                              minlength=self.vq.codebook_size)
+
+    @staticmethod
+    def format_codebook_usage(usage, label):
+        """One-line codebook-utilization summary from accumulated usage counts.
+
+        ``usage`` is an int Tensor of length codebook_size (sum of per-graph
+        :meth:`codebook_usage` bincounts).  Reports the number of codes ever
+        assigned, the top-5 share, and the entropy of the usage distribution —
+        a quick collapse check: a healthy codebook uses most codes with low
+        top-code concentration, a collapsed one uses a handful.
+        """
+        n_codes = int(len(usage))
+        total = int(usage.sum())
+        n_used = int((usage > 0).sum())
+        if total > 0:
+            frac = usage.float() / total
+            top5 = float(100 * frac.topk(min(5, n_codes)).values.sum())
+            p = frac[frac > 0]
+            entropy = float(-(p * p.log2()).sum())
+        else:
+            top5 = entropy = 0.0
+        return (f"[codebook] {label}: {n_used}/{n_codes} codes used "
+                f"({100 * n_used / n_codes:.0f}%), top-5 share {top5:.0f}%, "
+                f"entropy {entropy:.2f} bits")

@@ -34,6 +34,21 @@ def load_pickle(path):
         return pickle.load(f)
 
 
+def _hypergeom_enrichment(in_cluster, cluster_size, bg_size, bg_hit):
+    """Upper-tail hypergeometric enrichment p-value.
+
+    Mirror of surge/analysis.py: Fisher's exact conditions on BOTH margins, so
+    a cluster that is exactly the full set of a trait's lakes (in_other == 0)
+    — the STRONGEST enrichment — reports p = 1.0.  Conditioning only on the
+    cluster size and the background trait count gives it the tiny probability
+    it deserves.
+    """
+    from scipy.stats import hypergeom
+    if in_cluster <= 0 or bg_hit <= 0 or cluster_size <= 0:
+        return 1.0
+    return float(hypergeom.sf(in_cluster - 1, bg_size, bg_hit, cluster_size))
+
+
 def stratification_from_key(key):
     """Infer stratification type from key format."""
     key_str = str(key)
@@ -81,42 +96,48 @@ class EnrichmentAnalyzer:
 
             # --- Role × Ecotype ---
             if self.data:
-                combos = []
-                for k in keys:
-                    lake = k.split(' (')[0] if ' (' in k else k
-                    role = self.data.get_lake_role(lake)
-                    eco = self.data.get_lake_ecotype(lake)
-                    combos.append(f'{role} {eco}')
-                combo_counts = Counter(combos)
+                # Unique-LAKE background (not per-key): self.keys holds every
+                # stratification of the same lake (year/sex/infection), so
+                # counting keys double-counts each lake up to 3× and inflates
+                # the enrichment tables.  Mirror surge/analysis.py.
+                cluster_lakes = sorted(
+                    {k.split(' (')[0] if ' (' in k else k for k in keys})
+                all_lakes = sorted(
+                    {k.split(' (')[0] if ' (' in k else k for k in self.keys})
+                n_lakes = len(cluster_lakes)
+                n_bg = len(all_lakes)
 
-                all_combos = []
-                for k in self.keys:
-                    lake = k.split(' (')[0] if ' (' in k else k
-                    role = self.data.get_lake_role(lake)
-                    eco = self.data.get_lake_ecotype(lake)
-                    all_combos.append(f'{role} {eco}')
-                bg_combos = Counter(all_combos)
+                combo_counts = Counter(
+                    f'{self.data.get_lake_role(l)} '
+                    f'{self.data.get_lake_ecotype(l)}' for l in cluster_lakes)
+                bg_combos = Counter(
+                    f'{self.data.get_lake_role(l)} '
+                    f'{self.data.get_lake_ecotype(l)}' for l in all_lakes)
 
                 info['role_ecotype'] = {}
                 for combo in ['Source Benthic', 'Source Limnetic',
                               'Recipient Benthic', 'Recipient Limnetic']:
                     in_cluster = combo_counts.get(combo, 0)
+                    if in_cluster == 0:
+                        continue
                     in_other = bg_combos.get(combo, 0) - in_cluster
-                    not_in_cluster = n - in_cluster
-                    not_in_other = len(self.keys) - n - in_other
-                    # No `in_other > 0` guard: the fully-contained case
-                    # (in_other == 0) is the STRONGEST enrichment and was
-                    # silently skipped before.
-                    if in_cluster > 0:
-                        _, p = fisher_exact([[in_cluster, not_in_cluster],
-                                             [in_other, not_in_other]])
-                        info['role_ecotype'][combo] = {
-                            'count': in_cluster,
-                            'pct': in_cluster / n,
-                            'fisher_p': float(p),
-                        }
+                    # Hypergeometric upper-tail, NOT Fisher: the fully-
+                    # contained case (in_other == 0) is the STRONGEST
+                    # enrichment — Fisher conditions on both margins and
+                    # returns p = 1.0 there.  Mirror surge/analysis.py.
+                    p = _hypergeom_enrichment(
+                        in_cluster, n_lakes, n_bg, bg_combos.get(combo, 0))
+                    info['role_ecotype'][combo] = {
+                        'count': in_cluster,
+                        'pct': in_cluster / n_lakes,
+                        'fisher_p': p,
+                    }
 
                 # --- Sex ---
+                # The enrichment universe is the SEX-SUFFIXED keys only: a
+                # year_lake or infection-suffixed key cannot be "not male", so
+                # counting it in the background biased the 2×2.  Mirror
+                # surge/analysis.py.
                 sexes = []
                 for k in keys:
                     if str(k).endswith('-f'):
@@ -124,29 +145,31 @@ class EnrichmentAnalyzer:
                     elif str(k).endswith('-m'):
                         sexes.append('Male')
                 if sexes:
-                    all_sex = []
-                    for k in self.keys:
-                        if str(k).endswith('-f'):
-                            all_sex.append('Female')
-                        elif str(k).endswith('-m'):
-                            all_sex.append('Male')
-                    bg_sex = Counter(all_sex)
+                    sex_keys_all = [k for k in self.keys
+                                    if str(k).endswith('-f')
+                                    or str(k).endswith('-m')]
+                    bg_sex = Counter(
+                        'Female' if str(k).endswith('-f') else 'Male'
+                        for k in sex_keys_all)
+                    n_sex = len(sex_keys_all)
+                    n_sex_cluster = len(sexes)
                     info['sex'] = {}
                     for s in ['Male', 'Female']:
                         in_cluster = sexes.count(s)
                         in_other = bg_sex.get(s, 0) - in_cluster
-                        not_in_cluster = n - in_cluster
-                        not_in_other = len(self.keys) - n - in_other
+                        not_in_cluster = n_sex_cluster - in_cluster
+                        not_in_other = n_sex - n_sex_cluster - in_other
                         if in_cluster > 0 and in_other > 0:
                             _, p = fisher_exact([[in_cluster, not_in_cluster],
                                                  [in_other, not_in_other]])
                             info['sex'][s] = {
                                 'count': in_cluster,
-                                'pct': in_cluster / n,
+                                'pct': in_cluster / n_sex_cluster,
                                 'fisher_p': float(p),
                             }
 
                 # --- Infection ---
+                # Same suffixed-keys-only universe as sex (see above).
                 infs = []
                 for k in keys:
                     m = re.search(r'\)-([01])$', str(k))
@@ -154,25 +177,26 @@ class EnrichmentAnalyzer:
                         infs.append('Infected' if int(m.group(1)) == 1
                                     else 'Non-infected')
                 if infs:
-                    all_inf = []
-                    for k in self.keys:
-                        m = re.search(r'\)-([01])$', str(k))
-                        if m:
-                            all_inf.append('Infected' if int(m.group(1)) == 1
-                                           else 'Non-infected')
-                    bg_inf = Counter(all_inf)
+                    inf_keys_all = [k for k in self.keys
+                                    if re.search(r'\)-([01])$', str(k))]
+                    bg_inf = Counter(
+                        'Infected' if re.search(r'\)-([01])$', str(k))
+                        .group(1) == '1' else 'Non-infected'
+                        for k in inf_keys_all)
+                    n_inf = len(inf_keys_all)
+                    n_inf_cluster = len(infs)
                     info['infection'] = {}
                     for lab in ['Infected', 'Non-infected']:
                         in_cluster = infs.count(lab)
                         in_other = bg_inf.get(lab, 0) - in_cluster
-                        not_in_cluster = n - in_cluster
-                        not_in_other = len(self.keys) - n - in_other
+                        not_in_cluster = n_inf_cluster - in_cluster
+                        not_in_other = n_inf - n_inf_cluster - in_other
                         if in_cluster > 0 and in_other > 0:
                             _, p = fisher_exact([[in_cluster, not_in_cluster],
                                                  [in_other, not_in_other]])
                             info['infection'][lab] = {
                                 'count': in_cluster,
-                                'pct': in_cluster / n,
+                                'pct': in_cluster / n_inf_cluster,
                                 'fisher_p': float(p),
                             }
 

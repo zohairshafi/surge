@@ -15,7 +15,7 @@ Cleanup before retraining:
        modal run modal_pipeline.py::cleanup
 
 Other utilities:
-       modal run modal_pipeline.py::wgcna_full
+       modal run modal_pipeline.py::run_wgcna
        modal run modal_pipeline.py::run_original_mappings
 
 Shared Modal volume ``rol_output`` bridges checkpoints between stages.
@@ -44,7 +44,7 @@ volume = modal.Volume.from_name("rol_output", create_if_missing=True)
 
 # Paths inside the volume
 DATA_DIR   = "/vol"        # files at volume root, not in a subdir
-OUTPUT_DIR = "/vol/25k_v5"
+OUTPUT_DIR = "/vol/10k_v2.0"
 
 # ---------------------------------------------------------------------------
 # Concurrency guard: all entrypoints share OUTPUT_DIR, so two simultaneous
@@ -97,7 +97,16 @@ def _acquire_run_lock(run_id, stale_secs=_STALE_SECS):
                 f"remove {lock_path} and retry."
             )
         print(f"[lock] Stale run lock (run_id={other}, "
-              f"{age/3600:.1f}h old) — overwriting")
+              f"{age/3600:.1f}h old) — removing and re-acquiring")
+        # The stale lock must actually be REMOVED before the O_EXCL create
+        # below, or the create fails on the existing file and the stale-lock
+        # recovery is dead code (a crashed run would permanently block every
+        # subsequent run until a human removes the file).  Tolerate the race
+        # where another container removed it first.
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
 
     try:
         fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
@@ -179,14 +188,19 @@ def _write_enrichment_summary(wgcna_dir, postprocess_dir):
     md_lines = []
     json_comps = {}
 
-    COMPARISONS = ['infection', 'sex', 'year']
+    # Comparison keys: infection and sex are flat; year contrasts are stored
+    # per-lake as 'year_<Lake>' (wgcna_pipeline), NOT as a single 'year' key.
+    # Iterating the actual keys (rather than a fixed ['infection','sex','year']
+    # list) is what surfaces the per-lake year tables — the old bare-'year'
+    # lookup always missed and reported "WGCNA failed" despite the data.
+    comp_keys = sorted(
+        c for c in wgcna_summary
+        if isinstance(wgcna_summary[c], dict) and 'modules_a' in wgcna_summary[c])
+    if not comp_keys:
+        md_lines.append("## WGCNA\n\n*No WGCNA comparisons produced data.*\n")
 
-    for comp in COMPARISONS:
-        info = wgcna_summary.get(comp)
-        if info is None:
-            md_lines.append(f"## {comp.title()}\n\n*WGCNA failed — no data produced.*\n")
-            json_comps[comp] = {'status': 'failed'}
-            continue
+    for comp in comp_keys:
+        info = wgcna_summary[comp]
 
         md_lines.append(f"## {info['label_a'].title()} vs {info['label_b'].title()}")
         md_lines.append(f"- {info['n_a']} fish ({info['label_a']}), "
@@ -212,7 +226,12 @@ def _write_enrichment_summary(wgcna_dir, postprocess_dir):
             'term_overlap': {'shared': [], 'vq_only': [], 'wgcna_only': []},
         }
 
-        comp_dir = _os.path.join(wgcna_dir, comp)
+        # Map comparison key → directory: 'infection'/'sex' are flat;
+        # 'year_<Lake>' lives under wgcna/year/<Lake> to match wgcna_pipeline.
+        if comp.startswith('year_'):
+            comp_dir = _os.path.join(wgcna_dir, 'year', comp[len('year_'):])
+        else:
+            comp_dir = _os.path.join(wgcna_dir, comp)
 
         # --- eigengene enrichments (per-group WGCNA GO) ---
         enrich_dir = _os.path.join(comp_dir, 'eigengene_enrichments')
@@ -496,6 +515,22 @@ def cpu_steps(batch_n_genes: int = 10000, top_n_genes: int = None,
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+        # LOUD GUARD: "all genes" (top_n_genes 0/None) is silently capped by
+        # the ComBat gene limit unless --batch-n-genes 0 is set.  The batch
+        # correction selects the top N genes and the pipeline's transcriptome
+        # IS that batch-corrected CSV, so a default batch_n_genes=10000 turns
+        # an intended ~23k (all-genes) run into a 10k run.
+        if (top_n_genes is None or top_n_genes == 0) and batch_n_genes > 0:
+            print("\n" + "=" * 72)
+            print("WARNING: 'all genes' requested (top_n_genes="
+                  f"{top_n_genes}) but --batch-n-genes {batch_n_genes} caps "
+                  "the ComBat-corrected gene set.")
+            print("  The pipeline transcriptome is the batch-corrected CSV, "
+                  "so the model will run on the top "
+                  f"{batch_n_genes:,} genes, NOT all ~23k.")
+            print("  Pass --batch-n-genes 0 to batch-correct ALL genes.")
+            print("=" * 72 + "\n")
+
         repo = "/root/rol_repo"
         sys.path.insert(0, repo)
         os.chdir(repo)
@@ -602,8 +637,8 @@ def train_steps(codebook_size: int = 100, top_n_genes: int = None,
             "--output-dir",    out_dir,
             "--epochs", str(epochs),
             "--lr", "1e-4",
-            "--commit-alpha", "0.25",
-            "--noise-scale", "5.0",
+            "--commit-alpha", "0.5",
+            "--noise-scale", "0.5",
             "--codebook-size", str(codebook_size),
             "--label-permutations", "1000",
         ]
@@ -654,6 +689,23 @@ def train_steps(codebook_size: int = 100, top_n_genes: int = None,
 def cleanup(keep_joint: bool = False):
     """Remove cached model + downstream files before retraining.
 
+    Preserves the graph data (so a retrain skips graph generation) and
+    removes everything generated from it: trained weights, training state,
+    embeddings, gene mappings, slopes, clustering, label permutation,
+    PERMANOVA, threshold baseline, elbow data, figures, postprocess, WGCNA.
+
+    KEPT (graph-build inputs + cache — needed so step 2 does not rebuild
+    the graphs):
+      graphs/, graphs_manifest.pkl, matrices.pkl, radii.pkl, data.pkl,
+      results_batch_corrected/, ncbi_loc_cache.json
+
+    DELETED (everything else — every retrainable/regenerable artifact):
+      model*.pt (incl. *_opt.pt / *_last.pt), model_loss.pkl,
+      train_meta.pkl, model_kwargs.pkl, embeddings*, gene_mappings*,
+      slopes*, clustering*, label_perm*, permanova.pkl,
+      threshold_baseline.pkl, elbow_data.pkl, elbow_combined.png,
+      figures*, postprocess/, wgcna/, and any *.progress.json
+
     When ``keep_joint=True``, preserves ``*_joint.*`` files and
     ``figures_joint/`` (same as the old ``cleanup_sequential``).
 
@@ -665,43 +717,40 @@ def cleanup(keep_joint: bool = False):
     volume.reload()
     _check_no_active_run()
 
-    if keep_joint:
-        to_remove = ["model.pt", "model.pt.progress.json", "model_kwargs.pkl",
-                     "embeddings.pkl", "gene_mappings.pkl",
-                     "slopes.pkl", "clustering.pkl", "label_perm.pkl"]
-        dirs_to_remove = ["figures", "postprocess"]
-    else:
-        to_remove = [
-            "model.pt", "model_joint.pt",
-            "model.pt.progress.json", "model_joint.pt.progress.json",
-            "embeddings.pkl", "embeddings_joint.pkl",
-            "gene_mappings.pkl", "gene_mappings_joint.pkl",
-            "slopes.pkl", "slopes_joint.pkl",
-            "clustering.pkl", "clustering_joint.pkl",
-            "label_perm.pkl", "label_perm_joint.pkl",
-        ]
-        dirs_to_remove = ["figures", "figures_joint", "postprocess"]
+    # Everything needed to re-enter training WITHOUT regenerating graphs.
+    keep = {
+        "graphs",                     # per-graph bundles (the expensive payload)
+        "graphs_manifest.pkl",        # graph-cache manifest (validates step 2)
+        "matrices.pkl",               # graph-build input
+        "radii.pkl",                  # per-gene noise sidecar (saved w/ graphs)
+        "data.pkl",                   # expression/metadata (downstream/rebuild)
+        "results_batch_corrected",    # batch-corrected expression input
+        "ncbi_loc_cache.json",        # harmless fetch cache
+    }
 
-    for fn in to_remove:
-        path = os.path.join(OUTPUT_DIR, fn)
-        if os.path.exists(path):
-            os.remove(path)
-            print(f"  Removed {fn}")
-
-    for fn in os.listdir(OUTPUT_DIR):
-        if fn.endswith('.progress.json'):
-            path = os.path.join(OUTPUT_DIR, fn)
-            os.remove(path)
-            print(f"  Removed {fn}")
-
-    for dn in dirs_to_remove:
-        path = os.path.join(OUTPUT_DIR, dn)
-        if os.path.exists(path):
+    removed_files = []
+    removed_dirs = []
+    for name in sorted(os.listdir(OUTPUT_DIR)):
+        if name in keep or name.startswith('.'):
+            continue
+        if keep_joint and "_joint" in name:
+            continue  # preserve joint-model artifacts
+        path = os.path.join(OUTPUT_DIR, name)
+        if os.path.isdir(path):
             shutil.rmtree(path)
-            print(f"  Removed {dn}/")
+            removed_dirs.append(name)
+        else:
+            os.remove(path)
+            removed_files.append(name)
+
+    for fn in removed_files:
+        print(f"  Removed {fn}")
+    for dn in removed_dirs:
+        print(f"  Removed {dn}/")
 
     label = " (sequential only)" if keep_joint else ""
-    print(f"[cleanup{label}] Done — safe to retrain.")
+    print(f"[cleanup{label}] Done — models + downstream removed, "
+          f"graphs preserved. Safe to retrain.")
     volume.commit()
 
 
@@ -740,12 +789,15 @@ def sequential_train(codebook_size: int = 100, top_n_genes: int = None,
 # ---------------------------------------------------------------------------
 @app.function(
     volumes={"/vol": volume},
-    timeout=14400,       # 4 hours
+    timeout=86400,       # 24 hours — the all-genes regime runs WGCNA on ~23k
+                         # genes × 18 comparisons (36 group runs); each is
+                         # minutes-to-tens-of-minutes and runs in its own
+                         # isolated subprocess.
     gpu=None,
     memory=65536,
     cpu=4,
 )
-def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5,
+def wgcna_full(top_n_genes: int = 0, min_expression: float = 0.0,
                codebook_size: int = 100):
     """Comprehensive WGCNA: infection, sex, year comparisons with VQ overlap.
 
@@ -757,6 +809,11 @@ def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5,
     outputs to ``OUTPUT_DIR/codes_{N}`` when N != 100, so this function reads
     the model outputs (mappings, figures) from the same redirected dir rather
     than silently consuming stale root files.
+
+    ``top_n_genes`` / ``min_expression`` are accepted for CLI compatibility
+    but are NO LONGER used for gene selection: WGCNA inherits the EXACT gene
+    set the SURGE pipeline trained on (gene_mappings['gene_names']) so the
+    SURGE-vs-WGCNA comparison is apples-to-apples.  Defaults are 0 / 0.0.
     """
     import os, sys, subprocess
 
@@ -849,13 +906,16 @@ def wgcna_full(top_n_genes: int = 5000, min_expression: float = 1e-5,
 
     # 1. Role — both paradigms (always tag with paradigm so
     #    _write_enrichment_summary correctly identifies sequential vs joint).
+    #    NOTE: use a SEPARATE variable for the role output dir — rebinding the
+    #    enclosing `out_dir` here would corrupt the _gm_for_figures closure
+    #    (gene-mappings path) and the postprocess/manuscript_stats targets below.
     for vq_dir, paradigm in [(vq_figures, vq_paradigm)] + \
                              ([(alt_vq_figures, alt_paradigm)]
                               if alt_vq_figures else []):
         role_csv = os.path.join(vq_dir, 'role_genes_for_go.csv')
         if os.path.exists(role_csv):
-            out_dir = os.path.join(wgcna_dir, f'role_{paradigm}')
-            _run_vq_enrichment(role_csv, out_dir,
+            role_out_dir = os.path.join(wgcna_dir, f'role_{paradigm}')
+            _run_vq_enrichment(role_csv, role_out_dir,
                                f"Role enrichment ({paradigm})")
 
     # --- Write enrichment summary to postprocess ------------------------
@@ -1041,10 +1101,15 @@ def run_original_mappings():
     cpu=8,
 )
 def regenerate_figures_remote():
-    """Re-run step 9 (figures) for both joint and sequential paradigms.
+    """Re-run step 9 (figures) for each trained paradigm.
 
     Uses cached model weights, embeddings, clustering, etc. from the volume.
     No retraining or recomputation of steps 0-8.
+
+    A paradigm is SKIPPED when its model checkpoint is absent (e.g. a
+    sequential-only run has no model_joint.pt): otherwise the pipeline would
+    silently retrain that paradigm from scratch, defeating the 'no
+    retraining' intent and burning hours of GPU.
     """
     import os, sys, subprocess
 
@@ -1052,7 +1117,16 @@ def regenerate_figures_remote():
     sys.path.insert(0, repo)
     os.chdir(repo)
 
-    for train_flag, label in [("--train-joint", "joint"), ("", "sequential")]:
+    for train_flag, label, model_name in [
+            ("--train-joint", "joint", "model_joint.pt"),
+            ("", "sequential", "model.pt")]:
+        model_path = os.path.join(OUTPUT_DIR, model_name)
+        if not os.path.exists(model_path):
+            print(f"[regenerate_figures] Skipping {label} — "
+                  f"{model_name} not found in {OUTPUT_DIR} "
+                  f"(paradigm never trained).")
+            continue
+
         cmd = [
             sys.executable, "-u", os.path.join(repo, "pipeline.py"),
             "--graphs-dir", OUTPUT_DIR,
@@ -1060,8 +1134,8 @@ def regenerate_figures_remote():
             "--device", "cpu",
             "--epochs", "20",
             "--lr", "1e-4",
-            "--commit-alpha", "0.25",
-            "--noise-scale", "5.0",
+            "--commit-alpha", "0.5",
+            "--noise-scale", "0.5",
             "--codebook-size", "100",
             "--label-permutations", "1000",
             "--stop-after", "10",
@@ -1085,6 +1159,114 @@ def regenerate_figures():
     """
     regenerate_figures_remote.remote()
     print("=== regenerate_figures complete ===")
+
+
+# ---------------------------------------------------------------------------
+# Regenerate embeddings + downstream from the CACHED model (no retraining)
+# ---------------------------------------------------------------------------
+@app.function(
+    volumes={"/vol": volume},
+    timeout=86400,
+    gpu='H100',
+    memory=65536,
+    cpu=8,
+)
+def regenerate_downstream_remote(codebook_size: int = 100):
+    """Regenerate embeddings and everything downstream from the CACHED model.
+
+    Deletes the downstream artifacts (embeddings, gene mappings, slopes,
+    clustering, label permutation, figures, postprocess) but KEEPS the trained
+    model checkpoints, then runs pipeline steps 3-10 (--stop-after 10).  Step 3
+    sees model.pt / model_joint.pt present and loads it WITHOUT retraining;
+    steps 4-10 regenerate with the current code (e.g. the multi-scale weighted
+    embeddings and all-level gene mappings).
+
+    Use this after a code change that only affects the embedding/downstream
+    stages — it does not touch the trained weights.  NOTE: it does NOT re-run
+    the WGCNA phase; re-run ``wgcna_full`` separately if the VQ↔WGCNA overlap
+    (which reads the refreshed gene_mappings) needs to catch up.
+    """
+    import os, sys, subprocess, shutil
+
+    volume.reload()
+    run_id = uuid.uuid4().hex[:8]
+    _acquire_run_lock(run_id)
+    try:
+        out_dir = (OUTPUT_DIR if codebook_size == 100
+                   else os.path.join(OUTPUT_DIR, f"codes_{codebook_size}"))
+
+        # Which paradigm(s) were trained (have a model checkpoint)?
+        paradigms = []
+        if os.path.exists(os.path.join(out_dir, "model.pt")):
+            paradigms.append(("", "sequential"))
+        if os.path.exists(os.path.join(out_dir, "model_joint.pt")):
+            paradigms.append(("--train-joint", "joint"))
+        if not paradigms:
+            print("[regenerate_downstream] No model checkpoint found in "
+                  f"{out_dir} — nothing to regenerate.")
+            return
+
+        # Delete downstream artifacts, KEEPING the model checkpoints.
+        # permanova.pkl / threshold_baseline.pkl are step-9 CACHES — if left in
+        # place, step 9 reuses them and the PERMANOVA factor change (e.g.
+        # dropping the redundant Ancestry factor) never takes effect.
+        files = ["embeddings.pkl", "gene_mappings.pkl", "slopes.pkl",
+                 "clustering.pkl", "label_perm.pkl",
+                 "permanova.pkl", "threshold_baseline.pkl"]
+        dirs = ["figures", "postprocess"]
+        for suffix in ("", "_joint"):
+            for fn in files:
+                p = os.path.join(out_dir, fn.replace(".pkl", f"{suffix}.pkl"))
+                if os.path.exists(p):
+                    os.remove(p)
+                    print(f"  Removed {os.path.basename(p)}")
+            for dn in dirs:
+                p = os.path.join(out_dir, f"{dn}{suffix}")
+                if os.path.exists(p):
+                    shutil.rmtree(p)
+                    print(f"  Removed {os.path.basename(p)}/")
+
+        repo = "/root/rol_repo"
+        sys.path.insert(0, repo)
+        os.chdir(repo)
+
+        for train_flag, label in paradigms:
+            cmd = [
+                sys.executable, "-u", os.path.join(repo, "pipeline.py"),
+                "--graphs-dir", OUTPUT_DIR,
+                "--output-dir", out_dir,
+                "--device", "cuda",
+                "--epochs", "20",
+                "--lr", "1e-4",
+                "--commit-alpha", "0.5",
+                "--noise-scale", "0.5",
+                "--codebook-size", str(codebook_size),
+                "--label-permutations", "1000",
+                "--stop-after", "10",
+            ]
+            if train_flag:
+                cmd.append(train_flag)
+            print(f"[regenerate_downstream] Running steps 3-10 "
+                  f"({label}, cached model)...")
+            subprocess.run(cmd, check=True)
+            print(f"[regenerate_downstream] Done ({label})")
+
+        volume.commit()
+        print("[regenerate_downstream] Complete — embeddings and downstream "
+              "regenerated from the cached model.")
+    finally:
+        _release_run_lock(run_id)
+
+
+@app.local_entrypoint()
+def regenerate_downstream():
+    """Regenerate embeddings + downstream from the cached model (no retrain).
+
+    Usage:
+        modal run modal_pipeline.py::regenerate_downstream
+    """
+    regenerate_downstream_remote.remote()
+    print("=== regenerate_downstream complete ===")
 
 
 # ---------------------------------------------------------------------------
@@ -1117,15 +1299,26 @@ def joint(codebook_size: int = 100, top_n_genes: int = None,
 
 @app.local_entrypoint()
 def sequential(codebook_size: int = 100, top_n_genes: int = None,
-               min_expression: float = 0.0, batch_n_genes: int = 10000):
+               min_expression: float = 0.0, batch_n_genes: int = 10000,
+               graph_batch_size: int = 0, run_wgcna: bool = True):
     """End-to-end sequential (per-graph) training pipeline.
 
     Phase 1 — CPU: steps 0-2 (batch correction, expression matrices, graphs)
     Phase 2 — GPU: steps 3-10 (train VQGNN per-graph, figures, post-processing)
+    Phase 3 — WGCNA (module discovery + VQ comparison), when ``run_wgcna=True``.
+
+    ``graph_batch_size``: load graphs from disk in batches of this size and
+    train with the same prefetch worker the train-both path uses (bounds CPU
+    RAM).  Use e.g. 50 for the all-genes regime (23k genes) where loading
+    every graph bundle at once can OOM the container; 0 = load all at once.
+
+    ``run_wgcna``: set False to skip the WGCNA stage and run SURGE only.
 
     Usage:
         modal run modal_pipeline.py::sequential
         modal run modal_pipeline.py::sequential --batch-n-genes 0  # all genes
+        modal run modal_pipeline.py::sequential --top-n-genes 0 --graph-batch-size 50
+        modal run modal_pipeline.py::sequential --run-wgcna False  # SURGE only
     """
     print("=== Phase 1: CPU (steps 0-2) ===")
     run_id = uuid.uuid4().hex[:8]
@@ -1133,7 +1326,14 @@ def sequential(codebook_size: int = 100, top_n_genes: int = None,
                      run_id=run_id)
     print("=== Phase 2: GPU sequential training (steps 3-10) ===")
     train_steps.remote(codebook_size, top_n_genes, min_expression,
-                       train_joint=False, run_id=run_id)
+                       train_joint=False,
+                       graph_batch_size=graph_batch_size,
+                       run_id=run_id)
+    if run_wgcna:
+        print("=== Phase 3: WGCNA (module discovery + VQ comparison) ===")
+        wgcna_full.remote(top_n_genes=top_n_genes or 0,
+                          min_expression=min_expression,
+                          codebook_size=codebook_size)
     print("=== sequential complete ===")
 
 
@@ -1214,5 +1414,24 @@ def postprocess():
     """
     postprocess_remote.remote()
     print("=== postprocess complete ===")
+
+
+@app.local_entrypoint()
+def run_wgcna(codebook_size: int = 100, top_n_genes: int = 0,
+              min_expression: float = 0.0):
+    """Run the WGCNA phase standalone (module discovery + preservation + VQ overlap).
+
+    Uses the cached matrices.pkl + gene_mappings.pkl in OUTPUT_DIR; does NOT
+    need the trained model and does NOT retrain.  Requires matrices.pkl and
+    gene_mappings.pkl to already exist (run sequential / regenerate_downstream
+    first if needed).  Each group's WGCNA runs in an isolated subprocess, so a
+    native R crash in one group is contained and retried.
+
+    Usage:
+        modal run modal_pipeline.py::run_wgcna
+    """
+    wgcna_full.remote(top_n_genes=top_n_genes, min_expression=min_expression,
+                      codebook_size=codebook_size)
+    print("=== run_wgcna complete ===")
 
 

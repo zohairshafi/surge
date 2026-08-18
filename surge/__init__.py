@@ -15,7 +15,7 @@ data        - SticklebackData: load CSVs, build mappings, stratify expression da
 graphs      - CoexpressionGraphBuilder: build gene co-expression networks
 vqgnn       - VQGNN: Vector-Quantized Graph Neural Network model
 embedder    - LakeEmbedder: train VQGNN and generate VQ-code histogram embeddings
-analysis    - LakeAnalyzer, GeneNetworkAnalyzer: PCA, Wasserstein, gene networks
+analysis    - LakeAnalyzer: PCA, Wasserstein, gene networks
 plotting    - Visualization utilities for embeddings and gene networks
 batch_correction - ComBat batch correction for raw RNA-seq count data
 """
@@ -24,4 +24,4 @@ from .data import SticklebackData
 from .graphs import CoexpressionGraphBuilder
 from .vqgnn import VQGNN
 from .embedder import LakeEmbedder
-from .analysis import LakeAnalyzer, GeneNetworkAnalyzer
+from .analysis import LakeAnalyzer  # GeneNetworkAnalyzer commented out (dead)

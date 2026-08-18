@@ -70,6 +70,29 @@ def _attach_qvalues(results, pkey='p_value'):
     return results
 
 
+def _hypergeom_enrichment(in_cluster, cluster_size, bg_size, bg_hit):
+    """Upper-tail hypergeometric p-value for trait over-representation.
+
+    P(X >= in_cluster) with X ~ Hypergeom(N=bg_size, K=bg_hit, n=cluster_size)
+    — the exact ``phyper(..., lower.tail=FALSE)`` enrichment test.
+
+    Why NOT Fisher's exact test (the previous implementation): Fisher
+    conditions on BOTH margins, so when a cluster is exactly the full set of a
+    trait's lakes (in_other == 0, e.g. a cluster containing all 4
+    Source-Benthic lakes), the margins force the single table
+    [[n, 0], [0, bg-n]] and Fisher returns p = 1.0 — the STRONGEST possible
+    enrichment reported as non-significant. The hypergeometric conditions only
+    on the cluster size and the background trait count, so full containment
+    yields the tiny probability 1 / C(bg, n). This is the standard enrichment
+    test used by GO/DAVID-style tools.
+    """
+    from scipy.stats import hypergeom
+    if in_cluster <= 0 or bg_hit <= 0 or cluster_size <= 0:
+        return 1.0
+    # P(X >= in_cluster) == survival at (in_cluster - 1).
+    return float(hypergeom.sf(in_cluster - 1, bg_size, bg_hit, cluster_size))
+
+
 # ---------------------------------------------------------------------------
 # PERMANOVA helpers: multivariable marginal (Type-III) model, block-restricted
 # permutations, and betadisper. Pure numpy so the analysis needs no extra
@@ -111,10 +134,10 @@ def _explained_ss(X, G):
     """
     if X.shape[1] == 0:
         return 0.0
-    try:
-        XtX_inv = np.linalg.pinv(X.T @ X)
-    except np.linalg.LinAlgError:
-        return 0.0
+    # No try/except → 0.0: if the SVD in pinv genuinely fails (e.g. a
+    # non-finite design), that is a real error and must propagate loudly —
+    # silently reporting SS=0 would poison every factor's F and p.
+    XtX_inv = np.linalg.pinv(X.T @ X)
     return max(float(np.trace(XtX_inv @ (X.T @ G @ X))), 0.0)
 
 
@@ -208,7 +231,13 @@ def _emd_exact(a, b, C):
     res = linprog(C.ravel(), A_eq=A_eq, b_eq=np.concatenate([a, b]),
                   bounds=[(0, None)] * (n * n), method='highs')
     if not res.success:
-        return float(np.nan)
+        # No silent NaN: a NaN distance would propagate through every slope,
+        # mean and p-value downstream (compute_temporal_slopes / ttest / MWU)
+        # with no indication. A HiGHS failure on a valid LP is a real error.
+        raise RuntimeError(
+            f"[_emd_exact] transport LP failed to converge: "
+            f"{res.message.strip()} (n={n}). Refusing to return a NaN "
+            f"distance.")
     return float(res.fun)
 
 
@@ -261,7 +290,13 @@ class LakeAnalyzer:
         if self._cost_matrix is not None:
             sa, sb = a.sum(), b.sum()
             if sa <= 0 or sb <= 0:
-                return 0.0
+                # A zero-mass histogram is NOT "identical to everything": OT
+                # between a zero-mass and a positive-mass distribution is
+                # undefined, and reporting distance 0.0 fabricates "no drift".
+                raise ValueError(
+                    f"[_wasserstein_code_distance] zero-mass histogram "
+                    f"(sum_a={sa}, sum_b={sb}). Embeddings must sum to a "
+                    f"positive codebook weight.")
             wa, wb = a / sa, b / sb  # normalized distributions
             return _emd_exact(wa, wb, self._cost_matrix)
         return float(wasserstein_distance(a, b))
@@ -352,7 +387,7 @@ class LakeAnalyzer:
     # Wasserstein temporal drift
     # ------------------------------------------------------------------
 
-    def wasserstein_temporal(self, base_year=2019):
+    def wasserstein_temporal(self, base_year=2019, suffix=None):
         """
         For each lake, compute Wasserstein distance between the base year's
         embedding and each subsequent year's embedding.
@@ -365,6 +400,14 @@ class LakeAnalyzer:
         ----------
         base_year : int
             Reference year for comparison (default 2019, the transplant year).
+        suffix : str or None
+            When given (e.g. '-f', '-m', '-0', '-1'), build the per-lake
+            temporal series using ONLY keys carrying this suffix — i.e. within
+            a single sex or infection status.  This is how per-status grids
+            ('do female networks drift differently from male networks?') are
+            computed.  When None (default), only unsuffixed year_lake keys are
+            used, and suffixed keys are skipped loudly (they would otherwise
+            collide at (lake, year)).
 
         Returns
         -------
@@ -373,19 +416,27 @@ class LakeAnalyzer:
         """
         lake_years = defaultdict(dict)
         n_skipped_suffixed = 0
+        n_mismatched = 0
         for key, hist in self.embeddings.items():
             if ' (' not in key:
                 continue
             lake, rest = key.split(' (', 1)
             if ')' not in rest:
                 continue
-            year_part, _, suffix = rest.partition(')')
-            # Only year_lake stratifications (e.g. 'Lake (2021)') belong in a
-            # per-lake temporal series.  sex/infection-suffixed keys
-            # ('Lake (2021)-f', 'Lake (2021)-0') share the same (lake, year)
-            # and would silently OVERWRITE each other in the dict, so they
-            # are skipped loudly instead.
-            if suffix.strip():
+            year_part, _, key_suffix = rest.partition(')')
+            key_suffix = key_suffix.strip()
+            if suffix is not None:
+                # Per-status series: keep only keys with THIS suffix; keys of
+                # another status (or unsuffixed) are not part of the series.
+                if key_suffix != suffix:
+                    n_mismatched += 1
+                    continue
+            elif key_suffix:
+                # Lake-level series: only year_lake stratifications (e.g.
+                # 'Lake (2021)') belong.  sex/infection-suffixed keys
+                # ('Lake (2021)-f', 'Lake (2021)-0') share the same
+                # (lake, year) and would silently OVERWRITE each other in the
+                # dict, so they are skipped loudly instead.
                 n_skipped_suffixed += 1
                 continue
             try:
@@ -395,6 +446,11 @@ class LakeAnalyzer:
             lake_years[lake][year] = hist
 
         if not lake_years and self.embeddings:
+            if suffix is not None:
+                raise ValueError(
+                    f"[wasserstein_temporal] No embeddings matched "
+                    f"suffix='{suffix}' in this analyzer — cannot build a "
+                    f"per-status temporal series.")
             raise ValueError(
                 "[wasserstein_temporal] No year_lake embeddings found — the "
                 "analyzer holds only suffixed (sex/infection) stratifications. "
@@ -404,13 +460,19 @@ class LakeAnalyzer:
             print(f"[wasserstein_temporal] Skipped {n_skipped_suffixed} "
                   f"non-year_lake keys (sex/infection-suffixed); temporal "
                   f"series uses only year_lake embeddings.")
+        if suffix is not None and n_mismatched:
+            print(f"[wasserstein_temporal] Ignored {n_mismatched} keys that "
+                  f"do not match suffix='{suffix}'; temporal series uses "
+                  f"'{suffix}' embeddings only.")
 
         result = {}
+        n_fallback_base = 0
         for lake, year_hists in lake_years.items():
             if base_year in year_hists:
                 base_yr = base_year
             else:
                 base_yr = min(year_hists)
+                n_fallback_base += 1
             base_hist = year_hists[base_yr]
             dists = [(yr, self._wasserstein_code_distance(base_hist, hist))
                      for yr, hist in sorted(year_hists.items())
@@ -418,18 +480,33 @@ class LakeAnalyzer:
             if dists:
                 result[lake] = dists
 
+        if n_fallback_base:
+            # Lakes first sampled after base_year use their earliest sample as
+            # the reference, so their distances are NOT on the same scale as
+            # lakes with a true base_year baseline.  Loudly flag this — the
+            # endpoint Source/Recipient comparison would otherwise compare
+            # lakes at unequal baselines (and unequal horizons).
+            print(f"[wasserstein_temporal] {n_fallback_base} lake(s) had no "
+                  f"base_year={base_year} sample and used their earliest year "
+                  f"as baseline instead: "
+                  f"{', '.join(sorted(l for l in lake_years if base_year not in lake_years[l]))}. "
+                  f"Endpoint drift comparisons across lakes are on differing "
+                  f"baselines.")
+
         return result
 
-    def wasserstein_temporal_or_skip(self, base_year=2019):
+    def wasserstein_temporal_or_skip(self, base_year=2019, suffix=None):
         """Like ``wasserstein_temporal`` but returns ``{}`` with a loud note
         instead of raising when this analyzer's keys don't define an
         unambiguous per-lake temporal series (e.g. a sex/infection-suffixed
-        sub-analyzer, where 'Lake (2021)-f' and 'Lake (2021)-m' collide per
-        lake-year).  Per-stratification figure loops use this so a
+        sub-analyzer with no ``suffix``, where 'Lake (2021)-f' and
+        'Lake (2021)-m' collide per lake-year).  ``suffix`` is forwarded to
+        ``wasserstein_temporal`` so per-status series ('-f', '-m', '-0', '-1')
+        can be requested.  Per-stratification figure loops use this so a
         legitimately-undefined stratification is skipped loudly rather than
         crashing the pipeline."""
         try:
-            return self.wasserstein_temporal(base_year=base_year)
+            return self.wasserstein_temporal(base_year=base_year, suffix=suffix)
         except ValueError as exc:
             print(f"  [wasserstein_temporal] Skipped: {exc}")
             return {}
@@ -614,7 +691,7 @@ class LakeAnalyzer:
         lakes differ in their rate of network divergence.
 
         Runs both a t-test (parametric) and Mann-Whitney U (non-parametric).
-        Requires at least 3 lakes per group for meaningful statistics.
+        Requires at least 2 lakes per group for the statistics to run.
 
         Parameters
         ----------
@@ -754,11 +831,12 @@ class LakeAnalyzer:
                     if in_cluster == 0:
                         continue
                     in_other = bg_combos.get(combo, 0) - in_cluster
-                    # NOTE: no `in_other > 0` guard — the fully-contained
-                    # case (in_other == 0) is the STRONGEST enrichment and
-                    # must be reported, not skipped.
-                    _, p = fisher_exact([[in_cluster, n_lakes - in_cluster],
-                                         [in_other, n_bg - n_lakes - in_other]])
+                    # Hypergeometric upper-tail enrichment (NOT Fisher's exact):
+                    # the fully-contained case (in_other == 0) is the STRONGEST
+                    # enrichment and must get the tiny p it deserves — Fisher
+                    # conditions on both margins and reports p = 1.0 there.
+                    p = _hypergeom_enrichment(
+                        in_cluster, n_lakes, n_bg, bg_combos.get(combo, 0))
                     info['role_ecotype_enrichment'][combo] = {
                         'count': in_cluster, 'pct': in_cluster / n_lakes,
                         'fisher_p': float(p),
@@ -776,8 +854,8 @@ class LakeAnalyzer:
                     if in_cluster == 0:
                         continue
                     in_other = bg_roles.get(role, 0) - in_cluster
-                    _, p = fisher_exact([[in_cluster, n_lakes - in_cluster],
-                                         [in_other, n_bg - n_lakes - in_other]])
+                    p = _hypergeom_enrichment(
+                        in_cluster, n_lakes, n_bg, bg_roles.get(role, 0))
                     info['role_enrichment'][role] = {
                         'count': in_cluster, 'pct': in_cluster / n_lakes,
                         'fisher_p': float(p),
@@ -795,14 +873,18 @@ class LakeAnalyzer:
                     if in_cluster == 0:
                         continue
                     in_other = bg_eco.get(eco, 0) - in_cluster
-                    _, p = fisher_exact([[in_cluster, n_lakes - in_cluster],
-                                         [in_other, n_bg - n_lakes - in_other]])
+                    p = _hypergeom_enrichment(
+                        in_cluster, n_lakes, n_bg, bg_eco.get(eco, 0))
                     info['ecotype_enrichment'][eco] = {
                         'count': in_cluster, 'pct': in_cluster / n_lakes,
                         'fisher_p': float(p),
                     }
 
                 # --- Sex (Male / Female) — only when keys carry sex suffixes ---
+                # The enrichment universe is the SEX-SUFFIXED keys only: a
+                # year_lake or infection-suffixed key cannot be "not male",
+                # so counting it in the background biased the 2×2 toward
+                # whatever strata dominate self.keys.
                 sexes = []
                 for k in keys:
                     if str(k).endswith('-f'):
@@ -811,29 +893,32 @@ class LakeAnalyzer:
                         sexes.append('Male')
                 if sexes:
                     info['sex_counts'] = dict(Counter(sexes))
-                    all_sex = []
-                    for k in self.keys:
-                        if str(k).endswith('-f'):
-                            all_sex.append('Female')
-                        elif str(k).endswith('-m'):
-                            all_sex.append('Male')
-                    bg_sex = Counter(all_sex)
+                    sex_keys_all = [k for k in self.keys
+                                    if str(k).endswith('-f')
+                                    or str(k).endswith('-m')]
+                    bg_sex = Counter(
+                        'Female' if str(k).endswith('-f') else 'Male'
+                        for k in sex_keys_all)
+                    n_sex = len(sex_keys_all)
+                    n_sex_cluster = len(sexes)
                     info['sex_enrichment'] = {}
                     for s in ['Male', 'Female']:
                         in_cluster = sexes.count(s)
                         in_other = bg_sex.get(s, 0) - in_cluster
-                        not_in_cluster = n - in_cluster
-                        not_in_other = len(self.keys) - n - in_other
+                        not_in_cluster = n_sex_cluster - in_cluster
+                        not_in_other = n_sex - n_sex_cluster - in_other
                         if in_cluster > 0 and in_other > 0:
                             _, p = fisher_exact([[in_cluster, not_in_cluster],
                                                  [in_other, not_in_other]])
                             info['sex_enrichment'][s] = {
-                                'count': in_cluster, 'pct': in_cluster / n,
+                                'count': in_cluster,
+                                'pct': in_cluster / n_sex_cluster,
                                 'fisher_p': float(p),
                             }
 
                 # --- Infection (0=non-infected / 1=infected) — only when
                 #     keys carry infection suffixes ---
+                # Same suffixed-keys-only universe as sex (see above).
                 infs = []
                 for k in keys:
                     m = re.search(r'\)-([01])$', str(k))
@@ -842,24 +927,26 @@ class LakeAnalyzer:
                                     else 'Non-infected')
                 if infs:
                     info['infection_counts'] = dict(Counter(infs))
-                    all_inf = []
-                    for k in self.keys:
-                        m = re.search(r'\)-([01])$', str(k))
-                        if m:
-                            all_inf.append('Infected' if int(m.group(1)) == 1
-                                           else 'Non-infected')
-                    bg_inf = Counter(all_inf)
+                    inf_keys_all = [k for k in self.keys
+                                    if re.search(r'\)-([01])$', str(k))]
+                    bg_inf = Counter(
+                        'Infected' if re.search(r'\)-([01])$', str(k))
+                        .group(1) == '1' else 'Non-infected'
+                        for k in inf_keys_all)
+                    n_inf = len(inf_keys_all)
+                    n_inf_cluster = len(infs)
                     info['infection_enrichment'] = {}
                     for lab in ['Infected', 'Non-infected']:
                         in_cluster = infs.count(lab)
                         in_other = bg_inf.get(lab, 0) - in_cluster
-                        not_in_cluster = n - in_cluster
-                        not_in_other = len(self.keys) - n - in_other
+                        not_in_cluster = n_inf_cluster - in_cluster
+                        not_in_other = n_inf - n_inf_cluster - in_other
                         if in_cluster > 0 and in_other > 0:
                             _, p = fisher_exact([[in_cluster, not_in_cluster],
                                                  [in_other, not_in_other]])
                             info['infection_enrichment'][lab] = {
-                                'count': in_cluster, 'pct': in_cluster / n,
+                                'count': in_cluster,
+                                'pct': in_cluster / n_inf_cluster,
                                 'fisher_p': float(p),
                             }
 
@@ -932,7 +1019,8 @@ class LakeAnalyzer:
         -------
         dict : {code: {'infected_mean': float, 'noninfected_mean': float,
                         'fold_change': float, 'fisher_p': float}}
-            Sorted by significance (smallest p first).
+            Keyed by code (in code order); p-values are attached as
+            'p_value'/'q_value' on each entry.
         """
         # Filter to infection_year_lake keys only
         inf_keys = [k for k in self.keys
@@ -995,7 +1083,8 @@ class LakeAnalyzer:
     def sex_code_enrichment(self, codebook_size=100):
         """Test each VQ code for differential usage in Male vs Female.
 
-        Uses sex_year_lake keys only.  Returns dict sorted by p-value.
+        Uses sex_year_lake keys only.  Returns dict keyed by code (in code
+        order) with 'p_value'/'q_value' attached per entry.
         """
         sex_keys = [k for k in self.keys
                     if re.search(r'\)-[fFmM]$', str(k))]
@@ -1135,6 +1224,33 @@ class LakeAnalyzer:
         key_to_lake = {k: (k.split(' (')[0] if ' (' in k else k)
                        for k in labeled_keys}
         lakes = sorted({l for l in key_to_lake.values()})
+
+        # Lake-level block permutation is ONLY valid when the label is
+        # constant within a lake (source_recipient / ecotype / genotype).
+        # For labels that vary per key of the same lake (year, sex,
+        # infection), collapsing each lake to its first key's label would
+        # destroy the very signal being tested, and the null would measure
+        # lake-block separation instead of the label of interest.  Detect
+        # that and fall back to plain key-level permutation (there is no
+        # pseudo-replication to guard against when labels vary per key).
+        label_varies_within_lake = False
+        for l in lakes:
+            lake_keys = [k for k in labeled_keys if key_to_lake[k] == l]
+            if len({true_labels[k] for k in lake_keys}) > 1:
+                label_varies_within_lake = True
+                break
+
+        if label_varies_within_lake:
+            key_values = [true_labels[k] for k in labeled_keys]
+            null_scores = []
+            for _ in range(n_permutations):
+                perm_labels = dict(zip(labeled_keys,
+                                       rng.permutation(key_values)))
+                score = self.silhouette(perm_labels)
+                if not np.isnan(score):
+                    null_scores.append(score)
+            return null_scores, len(lakes)
+
         lake_label = {}
         for l in lakes:
             first_key = next(k for k in labeled_keys if key_to_lake[k] == l)
@@ -1178,6 +1294,11 @@ class LakeAnalyzer:
         """
         rng = np.random.RandomState(random_seed)
         true_labels = self.build_labels('source_recipient')
+        if not true_labels:
+            raise ValueError(
+                "[source_recipient_permutation_test] No Source/Recipient "
+                "labels could be built (requires data=SticklebackData with "
+                "the lake classification map).")
         observed = self.silhouette(true_labels)
 
         null_scores, n_lakes = self._permute_labels_lake_level(
@@ -1216,6 +1337,11 @@ class LakeAnalyzer:
         """
         rng = np.random.RandomState(random_seed)
         true_labels = self.build_labels(label_type)
+        if not true_labels:
+            raise ValueError(
+                f"[label_permutation_test] No keys were labeled for "
+                f"label_type='{label_type}'. Check the labels are present "
+                f"in the embedding keys.")
         observed = self.silhouette(true_labels)
 
         # Lake-level block permutation (see _permute_labels_lake_level): do not
@@ -1279,8 +1405,16 @@ class LakeAnalyzer:
         rng = np.random.default_rng(random_seed)
         X = np.vstack([self.embeddings[k] for k in self.keys])
         n = X.shape[0]
-        if n < 3 or len(metadata) < n:
+        if n < 3:
             return {}
+        if len(metadata) != n:
+            # Positional pairing of metadata rows with self.keys is the whole
+            # contract here; a length mismatch would silently mislabel every
+            # embedding row and produce wrong PERMANOVA results. Fail loudly.
+            raise ValueError(
+                f"[permanova] len(metadata)={len(metadata)} does not match "
+                f"n={n} embedding keys. Metadata must be built in the exact "
+                f"order of self.keys (one dict per key).")
 
         # Euclidean distance matrix + Gower centering
         D = np.linalg.norm(X[:, None, :] - X[None, :, :], axis=-1)
@@ -1405,271 +1539,279 @@ class LakeAnalyzer:
         return dict(sorted(results.items(), key=lambda x: -x[1]['r2']))
 
 
-class GeneNetworkAnalyzer:
-    """
-    Analyzes gene co-occurrence patterns in VQ code assignments.
+# DEAD CODE (commented out): GeneNetworkAnalyzer class (never instantiated anywhere)
+#class GeneNetworkAnalyzer:
+#    """
+#    Analyzes gene co-occurrence patterns in VQ code assignments.
 
-    When VQGNN assigns genes to discrete codes, genes that consistently
-    share the same VQ code across different lake/year/sex/infection
-    stratifications are likely co-regulated or functionally related.
+#    When VQGNN assigns genes to discrete codes, genes that consistently
+#    share the same VQ code across different lake/year/sex/infection
+#    stratifications are likely co-regulated or functionally related.
 
-    The core analysis traces a gene of interest (e.g., spi1b.H, a
-    hematopoietic transcription factor) through the VQ codebook to find
-    its network neighbors.
+#    The core analysis traces a gene of interest (e.g., spi1b.H, a
+#    hematopoietic transcription factor) through the VQ codebook to find
+#    its network neighbors.
 
-    Parameters
-    ----------
-    gene_to_vq : dict {stratification_key: {gene_idx: [vq_codes]}}
-        Maps each stratification to gene→VQ-code assignments.
-    vq_to_gene : dict {stratification_key: {vq_code: [gene_indices]}}
-        Maps each stratification to VQ-code→gene assignments.
-    gene_names : list[str], optional
-        Gene names indexed by gene_idx. If provided, enables gene-name lookups.
-    """
+#    Parameters
+#    ----------
+#    gene_to_vq : dict {stratification_key: {gene_idx: [vq_codes]}}
+#        Maps each stratification to gene→VQ-code assignments.
+#    vq_to_gene : dict {stratification_key: {vq_code: [gene_indices]}}
+#        Maps each stratification to VQ-code→gene assignments.
+#    gene_names : list[str], optional
+#        Gene names indexed by gene_idx. If provided, enables gene-name lookups.
+#    """
 
-    def __init__(self, gene_to_vq, vq_to_gene, gene_names=None):
-        self.gene_to_vq = gene_to_vq
-        self.vq_to_gene = vq_to_gene
-        self.gene_names = gene_names
-        self.stratifications = sorted(gene_to_vq.keys())
+#    def __init__(self, gene_to_vq, vq_to_gene, gene_names=None):
+#        self.gene_to_vq = gene_to_vq
+#        self.vq_to_gene = vq_to_gene
+#        self.gene_names = gene_names
+#        self.stratifications = sorted(gene_to_vq.keys())
 
-    def _resolve_gene(self, gene):
-        """Resolve a gene identifier (name or index) to an index."""
-        if isinstance(gene, str) and self.gene_names:
-            try:
-                return self.gene_names.index(gene)
-            except ValueError:
-                raise ValueError(f"Gene '{gene}' not found in gene_names.")
-        return gene
+#    def _resolve_gene(self, gene):
+#        """Resolve a gene identifier (name or index) to an index."""
+#        if isinstance(gene, str):
+#            if self.gene_names:
+#                try:
+#                    return self.gene_names.index(gene)
+#                except ValueError:
+#                    raise ValueError(f"Gene '{gene}' not found in gene_names.")
+            # gene_names=None: _gene_label produced the stringified index,
+            # so map it back to an int (a non-numeric string is an error).
+#            if gene.isdigit():
+#                return int(gene)
+#            raise ValueError(
+#                f"Gene '{gene}' cannot be resolved without gene_names.")
+#        return gene
 
-    def _gene_label(self, gene_idx):
-        """Return gene name if available, else index string."""
-        if self.gene_names and gene_idx < len(self.gene_names):
-            return self.gene_names[gene_idx]
-        return str(gene_idx)
+#    def _gene_label(self, gene_idx):
+#        """Return gene name if available, else index string."""
+#        if self.gene_names and gene_idx < len(self.gene_names):
+#            return self.gene_names[gene_idx]
+#        return str(gene_idx)
 
     # ------------------------------------------------------------------
     # Co-occurrence counting
     # ------------------------------------------------------------------
 
-    def co_occurrence_counts(self, gene, stratification_key=None):
-        """
-        Count how many times each other gene shares a VQ code with the
-        target gene, across the specified stratification(s).
+#    def co_occurrence_counts(self, gene, stratification_key=None):
+#        """
+#        Count how many times each other gene shares a VQ code with the
+#        target gene, across the specified stratification(s).
 
-        Parameters
-        ----------
-        gene : int or str
-            Target gene index or name.
-        stratification_key : str or None
-            Specific stratification to query (e.g., 'Crystal (2021)-1').
-            If None, aggregates across all stratifications.
+#        Parameters
+#        ----------
+#        gene : int or str
+#            Target gene index or name.
+#        stratification_key : str or None
+#            Specific stratification to query (e.g., 'Crystal (2021)-1').
+#            If None, aggregates across all stratifications.
 
-        Returns
-        -------
-        counts : dict {gene_idx: int}
-            Co-occurrence counts for each gene that appears with the target.
-        """
-        gene_idx = self._resolve_gene(gene)
-        keys = [stratification_key] if stratification_key else self.stratifications
-        counts = Counter()
+#        Returns
+#        -------
+#        counts : dict {gene_idx: int}
+#            Co-occurrence counts for each gene that appears with the target.
+#        """
+#        gene_idx = self._resolve_gene(gene)
+#        keys = [stratification_key] if stratification_key else self.stratifications
+#        counts = Counter()
 
-        for key in keys:
-            if key not in self.gene_to_vq:
-                continue
-            if gene_idx not in self.gene_to_vq[key]:
-                continue
+#        for key in keys:
+#            if key not in self.gene_to_vq:
+#                continue
+#            if gene_idx not in self.gene_to_vq[key]:
+#                continue
             # VQ codes the target gene belongs to in this stratification
-            target_codes = self.gene_to_vq[key][gene_idx]
-            for code in target_codes:
-                if code in self.vq_to_gene.get(key, {}):
-                    for neighbor in self.vq_to_gene[key][code]:
-                        if neighbor != gene_idx:
-                            counts[neighbor] += 1
+#            target_codes = self.gene_to_vq[key][gene_idx]
+#            for code in target_codes:
+#                if code in self.vq_to_gene.get(key, {}):
+#                    for neighbor in self.vq_to_gene[key][code]:
+#                        if neighbor != gene_idx:
+#                            counts[neighbor] += 1
 
-        return dict(counts)
+#        return dict(counts)
 
     # ------------------------------------------------------------------
     # Ego network
     # ------------------------------------------------------------------
 
-    def build_ego_network(self, gene, stratification_key=None,
-                          percentile=99):
-        """
-        Build a NetworkX ego network centered on a gene.
+#    def build_ego_network(self, gene, stratification_key=None,
+#                          percentile=99):
+#        """
+#        Build a NetworkX ego network centered on a gene.
 
-        Only genes with co-occurrence count above the percentile threshold
-        are included as neighbors.
+#        Only genes with co-occurrence count above the percentile threshold
+#        are included as neighbors.
 
-        Parameters
-        ----------
-        gene : int or str
-            Target gene.
-        stratification_key : str or None
-            Stratification to query.
-        percentile : int
-            Percentile threshold for co-occurrence count (0-100).
+#        Parameters
+#        ----------
+#        gene : int or str
+#            Target gene.
+#        stratification_key : str or None
+#            Stratification to query.
+#        percentile : int
+#            Percentile threshold for co-occurrence count (0-100).
 
-        Returns
-        -------
-        G : networkx.Graph
-            Ego network (star centered on target gene).
-        """
-        gene_idx = self._resolve_gene(gene)
-        counts = self.co_occurrence_counts(gene_idx, stratification_key)
+#        Returns
+#        -------
+#        G : networkx.Graph
+#            Ego network (star centered on target gene).
+#        """
+#        gene_idx = self._resolve_gene(gene)
+#        counts = self.co_occurrence_counts(gene_idx, stratification_key)
 
-        if not counts:
-            return nx.Graph()
+#        if not counts:
+#            return nx.Graph()
 
         # Threshold at percentile
-        count_values = np.array(list(counts.values()))
-        threshold = np.percentile(count_values, percentile)
+#        count_values = np.array(list(counts.values()))
+#        threshold = np.percentile(count_values, percentile)
 
-        G = nx.Graph()
-        center_label = self._gene_label(gene_idx)
-        G.add_node(center_label)
+#        G = nx.Graph()
+#        center_label = self._gene_label(gene_idx)
+#        G.add_node(center_label)
 
-        for neighbor_idx, count in counts.items():
-            if count >= threshold:
-                neighbor_label = self._gene_label(neighbor_idx)
-                G.add_node(neighbor_label)
-                G.add_edge(center_label, neighbor_label, weight=count)
+#        for neighbor_idx, count in counts.items():
+#            if count >= threshold:
+#                neighbor_label = self._gene_label(neighbor_idx)
+#                G.add_node(neighbor_label)
+#                G.add_edge(center_label, neighbor_label, weight=count)
 
-        return G
+#        return G
 
     # ------------------------------------------------------------------
     # Expanded gene graph (second-order connections)
     # ------------------------------------------------------------------
 
-    def build_gene_graph(self, gene, stratification_key=None,
-                         percentile=99, min_degree=0):
-        """
-        Build an expanded gene network: start with the ego network, then
-        add edges between all ego-network neighbors that co-occur together
-        in VQ codes (second-order connections).
+#    def build_gene_graph(self, gene, stratification_key=None,
+#                         percentile=99, min_degree=0):
+#        """
+#        Build an expanded gene network: start with the ego network, then
+#        add edges between all ego-network neighbors that co-occur together
+#        in VQ codes (second-order connections).
 
-        This reveals the full co-regulation module around the target gene,
-        not just direct connections.
+#        This reveals the full co-regulation module around the target gene,
+#        not just direct connections.
 
-        Parameters
-        ----------
-        gene : int or str
-            Target gene.
-        stratification_key : str or None
-            Stratification to query.
-        percentile : int
-            Percentile threshold for co-occurrence.
-        min_degree : int
-            Remove nodes with degree less than this.
+#        Parameters
+#        ----------
+#        gene : int or str
+#            Target gene.
+#        stratification_key : str or None
+#            Stratification to query.
+#        percentile : int
+#            Percentile threshold for co-occurrence.
+#        min_degree : int
+#            Remove nodes with degree less than this.
 
-        Returns
-        -------
-        G : networkx.Graph
-            Expanded gene co-occurrence network.
-        """
-        gene_idx = self._resolve_gene(gene)
+#        Returns
+#        -------
+#        G : networkx.Graph
+#            Expanded gene co-occurrence network.
+#        """
+#        gene_idx = self._resolve_gene(gene)
 
         # Step 1: Build ego network
-        G = self.build_ego_network(gene_idx, stratification_key, percentile)
-        if G.number_of_nodes() < 2:
-            return G
+#        G = self.build_ego_network(gene_idx, stratification_key, percentile)
+#        if G.number_of_nodes() < 2:
+#            return G
 
-        center_label = self._gene_label(gene_idx)
-        neighbor_labels = [n for n in G.nodes() if n != center_label]
-        neighbor_indices = [
-            self._resolve_gene(n) for n in neighbor_labels
-        ]
+#        center_label = self._gene_label(gene_idx)
+#        neighbor_labels = [n for n in G.nodes() if n != center_label]
+#        neighbor_indices = [
+#            self._resolve_gene(n) for n in neighbor_labels
+#        ]
 
         # Step 2: Add edges between neighbors using pre-computed
         # co-occurrence counts.  co_occurrence_counts already aggregates
         # across all stratification keys, so a simple dict lookup gives
         # the pairwise weight — no need for an inner loop over keys.
-        for i, ni in enumerate(neighbor_indices):
-            ni_label = neighbor_labels[i]
-            ni_counts = self.co_occurrence_counts(ni, stratification_key)
-            for j, nj in enumerate(neighbor_indices):
-                if j <= i:
-                    continue
-                nj_label = neighbor_labels[j]
-                weight = ni_counts.get(nj, 0)
-                if weight > 0:
-                    G.add_edge(ni_label, nj_label, weight=weight)
+#        for i, ni in enumerate(neighbor_indices):
+#            ni_label = neighbor_labels[i]
+#            ni_counts = self.co_occurrence_counts(ni, stratification_key)
+#            for j, nj in enumerate(neighbor_indices):
+#                if j <= i:
+#                    continue
+#                nj_label = neighbor_labels[j]
+#                weight = ni_counts.get(nj, 0)
+#                if weight > 0:
+#                    G.add_edge(ni_label, nj_label, weight=weight)
 
         # Step 3: Filter by min degree
-        if min_degree > 0:
-            low_degree = [n for n, d in G.degree() if d < min_degree]
-            G.remove_nodes_from(low_degree)
+#        if min_degree > 0:
+#            low_degree = [n for n, d in G.degree() if d < min_degree]
+#            G.remove_nodes_from(low_degree)
 
-        return G
+#        return G
 
     # ------------------------------------------------------------------
     # VQ code statistics
     # ------------------------------------------------------------------
 
-    def code_sizes(self, stratification_key=None):
-        """
-        Get the number of genes assigned to each VQ code.
+#    def code_sizes(self, stratification_key=None):
+#        """
+#        Get the number of genes assigned to each VQ code.
 
-        Returns
-        -------
-        sizes : dict {vq_code: int}
-        """
-        keys = [stratification_key] if stratification_key else self.stratifications
-        sizes = Counter()
-        for key in keys:
-            if key in self.vq_to_gene:
-                for code, genes in self.vq_to_gene[key].items():
-                    sizes[code] += len(genes)
-        return dict(sizes)
+#        Returns
+#        -------
+#        sizes : dict {vq_code: int}
+#        """
+#        keys = [stratification_key] if stratification_key else self.stratifications
+#        sizes = Counter()
+#        for key in keys:
+#            if key in self.vq_to_gene:
+#                for code, genes in self.vq_to_gene[key].items():
+#                    sizes[code] += len(genes)
+#        return dict(sizes)
 
-    def gene_code_diversity(self, stratification_key=None):
-        """
-        Get the number of distinct VQ codes each gene appears in.
-        Genes appearing in many codes span multiple network contexts.
+#    def gene_code_diversity(self, stratification_key=None):
+#        """
+#        Get the number of distinct VQ codes each gene appears in.
+#        Genes appearing in many codes span multiple network contexts.
 
-        Returns
-        -------
-        diversity : dict {gene_idx: int}
-        """
-        keys = [stratification_key] if stratification_key else self.stratifications
-        diversity = Counter()
-        for key in keys:
-            if key in self.gene_to_vq:
-                for gene_idx, codes in self.gene_to_vq[key].items():
-                    diversity[gene_idx] += len(set(codes))
-        return dict(diversity)
+#        Returns
+#        -------
+#        diversity : dict {gene_idx: int}
+#        """
+#        keys = [stratification_key] if stratification_key else self.stratifications
+#        diversity = Counter()
+#        for key in keys:
+#            if key in self.gene_to_vq:
+#                for gene_idx, codes in self.gene_to_vq[key].items():
+#                    diversity[gene_idx] += len(set(codes))
+#        return dict(diversity)
 
     # ------------------------------------------------------------------
     # Permutation null models (sample shuffling)
     # ------------------------------------------------------------------
 
-    def co_occurrence_null(self, gene, permuted_gene_to_vq_list,
-                           stratification_key=None):
-        """
-        Compute null distribution of co-occurrence counts using permuted
-        VQ assignments (generated by shuffling fish labels before graph
-        construction).
+#    def co_occurrence_null(self, gene, permuted_gene_to_vq_list,
+#                           stratification_key=None):
+#        """
+#        Compute null distribution of co-occurrence counts using permuted
+#        VQ assignments (generated by shuffling fish labels before graph
+#        construction).
 
-        Parameters
-        ----------
-        gene : int or str
-            Target gene.
-        permuted_gene_to_vq_list : list[dict]
-            List of gene_to_vq dicts from each permutation run.
-        stratification_key : str or None
-            Specific stratification to query. If None, aggregates across
-            all stratifications.
+#        Parameters
+#        ----------
+#        gene : int or str
+#            Target gene.
+#        permuted_gene_to_vq_list : list[dict]
+#            List of gene_to_vq dicts from each permutation run.
+#        stratification_key : str or None
+#            Specific stratification to query. If None, aggregates across
+#            all stratifications.
 
-        Returns
-        -------
-        null_dist : dict {gene_idx: list[int]}
-            Null co-occurrence counts for each gene across permutations.
-        """
-        gene_idx = self._resolve_gene(gene)
-        null_dist = defaultdict(list)
+#        Returns
+#        -------
+#        null_dist : dict {gene_idx: list[int]}
+#            Null co-occurrence counts for each gene across permutations.
+#        """
+#        gene_idx = self._resolve_gene(gene)
+#        null_dist = defaultdict(list)
 
-        for perm_gene_to_vq in permuted_gene_to_vq_list:
-            keys = [stratification_key] if stratification_key else sorted(perm_gene_to_vq.keys())
+#        for perm_gene_to_vq in permuted_gene_to_vq_list:
+#            keys = [stratification_key] if stratification_key else sorted(perm_gene_to_vq.keys())
 
             # Build per-key vq_to_gene for this permutation, so the neighbour
             # lookup below is restricted to the SAME stratification (graph) as
@@ -1677,70 +1819,70 @@ class GeneNetworkAnalyzer:
             # across keys: pooling would let a gene co-occur with the target in
             # graphs it was never present in (merely sharing a code somewhere),
             # inflating the null and invalidating the empirical p-values.
-            perm_vq_to_gene = {}
-            for key in keys:
-                per_key = defaultdict(list)
-                for g_idx, codes in perm_gene_to_vq.get(key, {}).items():
-                    for c in codes:
-                        per_key[c].append(g_idx)
-                perm_vq_to_gene[key] = dict(per_key)
+#            perm_vq_to_gene = {}
+#            for key in keys:
+#                per_key = defaultdict(list)
+#                for g_idx, codes in perm_gene_to_vq.get(key, {}).items():
+#                    for c in codes:
+#                        per_key[c].append(g_idx)
+#                perm_vq_to_gene[key] = dict(per_key)
 
             # Compute co-occurrence with target, per key
-            counts = Counter()
-            for key in keys:
-                target_codes = perm_gene_to_vq.get(key, {}).get(gene_idx, [])
-                for code in target_codes:
-                    for neighbor in perm_vq_to_gene.get(key, {}).get(code, []):
-                        if neighbor != gene_idx:
-                            counts[neighbor] += 1
+#            counts = Counter()
+#            for key in keys:
+#                target_codes = perm_gene_to_vq.get(key, {}).get(gene_idx, [])
+#                for code in target_codes:
+#                    for neighbor in perm_vq_to_gene.get(key, {}).get(code, []):
+#                        if neighbor != gene_idx:
+#                            counts[neighbor] += 1
 
-            for neighbor, count in counts.items():
-                null_dist[neighbor].append(count)
+#            for neighbor, count in counts.items():
+#                null_dist[neighbor].append(count)
 
         # Pad permutations in which a neighbor was ABSENT (co-occurrence 0)
         # so empirical_pvalues' denominator is the TRUE number of
         # permutations, not just the count of permutations in which the
         # neighbor happened to appear.  Without this, genes that co-occur
         # only occasionally got artificially small denominators.
-        n_permutations = len(permuted_gene_to_vq_list)
-        for neighbor in list(null_dist.keys()):
-            missing = n_permutations - len(null_dist[neighbor])
-            if missing > 0:
-                null_dist[neighbor].extend([0] * missing)
+#        n_permutations = len(permuted_gene_to_vq_list)
+#        for neighbor in list(null_dist.keys()):
+#            missing = n_permutations - len(null_dist[neighbor])
+#            if missing > 0:
+#                null_dist[neighbor].extend([0] * missing)
 
-        return dict(null_dist)
+#        return dict(null_dist)
 
-    def empirical_pvalues(self, gene, observed_counts, null_dist):
-        """
-        Compute empirical p-values by comparing observed co-occurrence
-        counts against a null distribution from permutations.
+#    def empirical_pvalues(self, gene, observed_counts, null_dist):
+#        """
+#        Compute empirical p-values by comparing observed co-occurrence
+#        counts against a null distribution from permutations.
 
-        p = (n_null >= observed + 1) / (n_permutations + 1)
+#        p = (n_null >= observed + 1) / (n_permutations + 1)
 
-        Parameters
-        ----------
-        gene : int or str
-            Target gene.
-        observed_counts : dict {gene_idx: int}
-            Observed co-occurrence counts from real data.
-        null_dist : dict {gene_idx: list[int]}
-            Null co-occurrence counts from permutations.
+#        Parameters
+#        ----------
+#        gene : int or str
+#            Target gene.
+#        observed_counts : dict {gene_idx: int}
+#            Observed co-occurrence counts from real data.
+#        null_dist : dict {gene_idx: list[int]}
+#            Null co-occurrence counts from permutations.
 
-        Returns
-        -------
-        pvalues : dict {gene_idx: float}
-            Empirical p-value for each gene that appears in observed_counts.
-        """
-        gene_idx = self._resolve_gene(gene)
-        pvalues = {}
+#        Returns
+#        -------
+#        pvalues : dict {gene_idx: float}
+#            Empirical p-value for each gene that appears in observed_counts.
+#        """
+#        gene_idx = self._resolve_gene(gene)
+#        pvalues = {}
 
-        for neighbor, obs_count in observed_counts.items():
-            null_counts = null_dist.get(neighbor, [])
-            n_perm = len(null_counts)
-            if n_perm == 0:
-                pvalues[neighbor] = 1.0
-                continue
-            p = (np.sum(np.array(null_counts) >= obs_count) + 1) / (n_perm + 1)
-            pvalues[neighbor] = float(p)
+#        for neighbor, obs_count in observed_counts.items():
+#            null_counts = null_dist.get(neighbor, [])
+#            n_perm = len(null_counts)
+#            if n_perm == 0:
+#                pvalues[neighbor] = 1.0
+#                continue
+#            p = (np.sum(np.array(null_counts) >= obs_count) + 1) / (n_perm + 1)
+#            pvalues[neighbor] = float(p)
 
-        return pvalues
+#        return pvalues

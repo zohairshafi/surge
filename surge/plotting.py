@@ -138,6 +138,16 @@ class LakePlotter:
         """
         lakes = sorted(wasserstein_distances.keys())
         n_lakes = len(lakes)
+        if n_lakes == 0:
+            # The loop below never binds `i`, and `plt.subplots(0, ncols)` is
+            # degenerate — return an empty figure loudly instead of NameError.
+            print("  [wasserstein_grid] no lakes to plot — returning empty "
+                  "figure.")
+            fig, ax = plt.subplots(figsize=figsize)
+            ax.text(0.5, 0.5, 'No temporal data', ha='center', va='center',
+                    transform=ax.transAxes)
+            ax.axis('off')
+            return fig
         nrows = int(np.ceil(n_lakes / ncols))
 
         fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
@@ -216,131 +226,132 @@ class LakePlotter:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def gene_network(G, central_gene, ax=None, figsize=(10, 10),
-                     max_edges=500, max_nodes=None, label_offset=0.12,
-                     font_size=6):
-        """
-        Draw a gene co-occurrence network with circular layout.
+# DEAD CODE (commented out): LakePlotter.gene_network (never called)
+#    def gene_network(G, central_gene, ax=None, figsize=(10, 10),
+#                     max_edges=500, max_nodes=None, label_offset=0.12,
+#                     font_size=6):
+#        """
+#        Draw a gene co-occurrence network with circular layout.
 
-        The central gene is highlighted in red; all other genes are blue.
-        Node sizes are proportional to degree.  Labels are placed radially
-        outside nodes and rotated to follow the circle.
+#        The central gene is highlighted in red; all other genes are blue.
+#        Node sizes are proportional to degree.  Labels are placed radially
+#        outside nodes and rotated to follow the circle.
 
-        All edges incident to *central_gene* are always kept; *max_edges*
-        only limits edges between other nodes.  Isolated nodes (degree 0)
-        are dropped before rendering.
+#        All edges incident to *central_gene* are always kept; *max_edges*
+#        only limits edges between other nodes.  Isolated nodes (degree 0)
+#        are dropped before rendering.
 
-        Parameters
-        ----------
-        G : networkx.Graph
-            Gene co-occurrence network.
-        central_gene : str
-            Name of the central gene to highlight.
-        ax : matplotlib Axes, optional
-        figsize : tuple
-        max_edges : int or None
-            Maximum edges to draw.  Central-gene edges are always kept;
-            only edges between non-central nodes count toward this limit.
-            Set to None to draw all edges.
-        max_nodes : int or None
-            Maximum number of nodes to show.  Keeps the central gene plus
-            the top *max_nodes - 1* nodes by degree.  Set to None to show
-            all nodes.
-        label_offset : float
-            Radial distance beyond the layout circle for labels.
-        font_size : int
-            Font size for gene labels.
-        """
-        if ax is None:
-            _, ax = plt.subplots(figsize=figsize)
+#        Parameters
+#        ----------
+#        G : networkx.Graph
+#            Gene co-occurrence network.
+#        central_gene : str
+#            Name of the central gene to highlight.
+#        ax : matplotlib Axes, optional
+#        figsize : tuple
+#        max_edges : int or None
+#            Maximum edges to draw.  Central-gene edges are always kept;
+#            only edges between non-central nodes count toward this limit.
+#            Set to None to draw all edges.
+#        max_nodes : int or None
+#            Maximum number of nodes to show.  Keeps the central gene plus
+#            the top *max_nodes - 1* nodes by degree.  Set to None to show
+#            all nodes.
+#        label_offset : float
+#            Radial distance beyond the layout circle for labels.
+#        font_size : int
+#            Font size for gene labels.
+#        """
+#        if ax is None:
+#            _, ax = plt.subplots(figsize=figsize)
 
         # ---- edge filtering: preserve central-gene edges ----
-        if max_edges is not None and G.number_of_edges() > max_edges:
-            central_edges = []
-            other_edges = []
-            for u, v, d in G.edges(data=True):
-                w = d.get('weight', 1)
-                if u == central_gene or v == central_gene:
-                    central_edges.append((u, v, w))
-                else:
-                    other_edges.append((u, v, w))
+#        if max_edges is not None and G.number_of_edges() > max_edges:
+#            central_edges = []
+#            other_edges = []
+#            for u, v, d in G.edges(data=True):
+#                w = d.get('weight', 1)
+#                if u == central_gene or v == central_gene:
+#                    central_edges.append((u, v, w))
+#                else:
+#                    other_edges.append((u, v, w))
             # Keep all central-gene edges; limit only the other edges
-            other_edges.sort(key=lambda x: -x[2])
-            kept_other = other_edges[:max_edges]
-            G_sub = nx.Graph()
-            G_sub.add_nodes_from(G.nodes(data=True))
-            G_sub.add_weighted_edges_from(central_edges + kept_other)
-            G = G_sub
+#            other_edges.sort(key=lambda x: -x[2])
+#            kept_other = other_edges[:max_edges]
+#            G_sub = nx.Graph()
+#            G_sub.add_nodes_from(G.nodes(data=True))
+#            G_sub.add_weighted_edges_from(central_edges + kept_other)
+#            G = G_sub
 
         # ---- drop nodes orphaned by edge filtering ----
-        isolates = [n for n, d in G.degree() if d == 0 and n != central_gene]
-        if isolates:
-            G = G.copy()
-            G.remove_nodes_from(isolates)
+#        isolates = [n for n, d in G.degree() if d == 0 and n != central_gene]
+#        if isolates:
+#            G = G.copy()
+#            G.remove_nodes_from(isolates)
 
         # ---- limit node count to max_nodes (by degree) ----
-        if max_nodes is not None and G.number_of_nodes() > max_nodes:
-            degrees = dict(G.degree())
+#        if max_nodes is not None and G.number_of_nodes() > max_nodes:
+#            degrees = dict(G.degree())
             # Sort non-central nodes by degree descending, keep top max_nodes-1
-            other_nodes = sorted(
-                [n for n in G.nodes() if n != central_gene],
-                key=lambda n: -degrees.get(n, 0),
-            )
-            keep = set(other_nodes[:max_nodes - 1]) | {central_gene}
-            G = G.subgraph(keep).copy()
+#            other_nodes = sorted(
+#                [n for n in G.nodes() if n != central_gene],
+#                key=lambda n: -degrees.get(n, 0),
+#            )
+#            keep = set(other_nodes[:max_nodes - 1]) | {central_gene}
+#            G = G.subgraph(keep).copy()
 
-        pos = nx.circular_layout(G)
-        degrees = dict(G.degree())
+#        pos = nx.circular_layout(G)
+#        degrees = dict(G.degree())
 
         # Node colors: central gene in red, others in cerulean
-        node_colors = [
-            '#e41a1c' if n == central_gene else '#2b7bba'
-            for n in G.nodes()
-        ]
+#        node_colors = [
+#            '#e41a1c' if n == central_gene else '#2b7bba'
+#            for n in G.nodes()
+#        ]
         # Node sizes proportional to degree
-        max_deg = max(degrees.values()) if degrees else 1
-        node_sizes = [300 + (degrees[n] / max_deg) * 1000 for n in G.nodes()]
+#        max_deg = max(degrees.values()) if degrees else 1
+#        node_sizes = [300 + (degrees[n] / max_deg) * 1000 for n in G.nodes()]
 
-        nx.draw_networkx_edges(G, pos, alpha=0.2, ax=ax)
-        nx.draw_networkx_nodes(G, pos, node_color=node_colors,
-                               node_size=node_sizes, alpha=0.9, ax=ax)
+#        nx.draw_networkx_edges(G, pos, alpha=0.2, ax=ax)
+#        nx.draw_networkx_nodes(G, pos, node_color=node_colors,
+#                               node_size=node_sizes, alpha=0.9, ax=ax)
 
         # ---- radial labels (outside nodes, rotated to follow circle) ----
-        xs = [p[0] for p in pos.values()]
-        ys = [p[1] for p in pos.values()]
-        cx, cy = np.mean(xs), np.mean(ys)
-        max_r = max(np.hypot(x - cx, y - cy) for x, y in pos.values())
+#        xs = [p[0] for p in pos.values()]
+#        ys = [p[1] for p in pos.values()]
+#        cx, cy = np.mean(xs), np.mean(ys)
+#        max_r = max(np.hypot(x - cx, y - cy) for x, y in pos.values())
 
-        for node, (x, y) in pos.items():
-            dx, dy = x - cx, y - cy
-            angle = np.arctan2(dy, dx)
-            deg = np.degrees(angle)
+#        for node, (x, y) in pos.items():
+#            dx, dy = x - cx, y - cy
+#            angle = np.arctan2(dy, dx)
+#            deg = np.degrees(angle)
 
-            label_r = max_r + label_offset
-            lx = cx + label_r * np.cos(angle)
-            ly = cy + label_r * np.sin(angle)
+#            label_r = max_r + label_offset
+#            lx = cx + label_r * np.cos(angle)
+#            ly = cy + label_r * np.sin(angle)
 
-            if -90 < deg < 90:
-                rotation = deg
-                ha = 'left'
-            else:
-                rotation = deg + 180
-                ha = 'right'
+#            if -90 < deg < 90:
+#                rotation = deg
+#                ha = 'left'
+#            else:
+#                rotation = deg + 180
+#                ha = 'right'
 
-            ax.text(lx, ly, str(node),
-                    fontsize=font_size, ha=ha, va='center',
-                    rotation=rotation, rotation_mode='anchor')
+#            ax.text(lx, ly, str(node),
+#                    fontsize=font_size, ha=ha, va='center',
+#                    rotation=rotation, rotation_mode='anchor')
 
-        ax.axis('off')
-        ax.set_xlim(cx - label_r - 0.15, cx + label_r + 0.15)
-        ax.set_ylim(cy - label_r - 0.15, cy + label_r + 0.15)
-        return ax
+#        ax.axis('off')
+#        ax.set_xlim(cx - label_r - 0.15, cx + label_r + 0.15)
+#        ax.set_ylim(cy - label_r - 0.15, cy + label_r + 0.15)
+#        return ax
 
     # ------------------------------------------------------------------
     # VQ code distribution
     # ------------------------------------------------------------------
 
-    @staticmethod
+#    @staticmethod
     def code_distribution(vq_to_gene, gene_to_vq, ax=None):
         """
         Two-panel figure:

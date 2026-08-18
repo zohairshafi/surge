@@ -349,6 +349,9 @@ def train_sequential_shuffled(model, graphs, radii_dict, output_dir,
         epoch_edge_loss = 0.0
         epoch_commit_loss = 0.0
         n_graphs = 0
+        # Per-epoch codebook-utilization accumulator (nearly free — the
+        # forward pass already computes indices, we just stop discarding them).
+        usage = torch.zeros(model.vq.codebook_size, dtype=torch.long)
 
         pbar = tqdm(shuffled_keys, desc=f"  Epoch {epoch+1}/{epochs}",
                      unit="graph")
@@ -368,17 +371,19 @@ def train_sequential_shuffled(model, graphs, radii_dict, output_dir,
 
             if use_amp:
                 with autocast(dtype=torch.bfloat16):
-                    _, decoded, _, _, commit_loss = model(
+                    _, decoded, _, indices, commit_loss = model(
                         edge_index, radii=r_tensor, lake_idx=None
                     )
                     edge_loss = model.reconstruction_loss(decoded, target_adj)
                     loss = edge_loss + commit_alpha * commit_loss
+                usage += model.codebook_usage(indices)
             else:
-                _, decoded, _, _, commit_loss = model(
+                _, decoded, _, indices, commit_loss = model(
                     edge_index, radii=r_tensor, lake_idx=None
                 )
                 edge_loss = model.reconstruction_loss(decoded, target_adj)
                 loss = edge_loss + commit_alpha * commit_loss
+                usage += model.codebook_usage(indices)
 
             loss.backward()
             optimizer.step()
@@ -395,6 +400,7 @@ def train_sequential_shuffled(model, graphs, radii_dict, output_dir,
         total_loss = avg_edge + 0.1 * avg_commit
         print(f"    Epoch {epoch+1}: edge_loss={avg_edge:.4f}, "
               f"commit_loss={avg_commit:.4f}, crit={total_loss:.4f}")
+        print("    " + model.format_codebook_usage(usage, 'sim'))
 
         loss_history.append({
             "epoch": epoch + 1,

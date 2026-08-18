@@ -73,25 +73,6 @@ class LakeEmbedder:
 
         return graphs, bundled_radii
 
-    def _get_primary_graph(self, graph_entry):
-        """Return the first reconstruction graph and optional bundled radii."""
-        graphs, bundled_radii = self._load_graph_entry(graph_entry)
-
-        if isinstance(graphs, (list, tuple)):
-            if not graphs:
-                raise ValueError("Encountered an empty graph list.")
-            graph = graphs[0]
-        else:
-            graph = graphs
-
-        if isinstance(graph, dict) and graph.get('degenerate'):
-            raise ValueError("Cannot get primary graph from degenerate entry — "
-                             "check CoexpressionGraphBuilder.is_degenerate() first")
-        if not hasattr(graph, 'edge_index'):
-            raise TypeError("Graph entry must provide an edge_index tensor.")
-
-        return graph, bundled_radii
-
     @staticmethod
     def _resolve_radii_for_key(key, radii_dict, bundled_radii, n_nodes):
         """Resolve radii from explicit dict, bundle payload, or fallback ones."""
@@ -119,7 +100,7 @@ class LakeEmbedder:
     # ------------------------------------------------------------------
 
     def train(self, graphs_dict, radii_dict, save_path=None,
-              epochs=5, lr=1e-4, commit_alpha=0.25, noise_scale=5.0,
+              epochs=5, lr=1e-4, commit_alpha=0.5, noise_scale=0.5,
               recon_batch_size=256, skip_oom=True, preloaded_seq=None):
         """
         Train VQGNN sequentially on each graph in ``graphs_dict``.
@@ -201,8 +182,22 @@ class LakeEmbedder:
                 for i, g in enumerate(graphs):
                     if not hasattr(g, 'edge_index'):
                         continue
+                    # A zero-edge reconstruction level (only reachable for very
+                    # small gene sets, where the top-density quantile can be
+                    # populated entirely by diagonal entries that get masked)
+                    # would feed SAGEConv a graph with no aggregation — mean-
+                    # aggregation over zero edges yields NaN features that
+                    # silently corrupt the shared weights.  Skip it loudly.
+                    if g.edge_index.shape[1] == 0:
+                        print(f"  [train] {key}: reconstruction level {i} has "
+                              f"0 edges — skipping (avoids NaN forward pass).")
+                        continue
+                    # Principled multi-scale weight (marginal spectral mass,
+                    # graphs.py) with fallback to 1/(i+1) for old bundles.
+                    _w = getattr(g, 'recon_weight', None)
                     graph_data.append((key, g.edge_index, g.target_adj,
-                                       scaled_radii, 1.0 / (i + 1)))
+                                       scaled_radii,
+                                       _w if _w is not None else 1.0 / (i + 1)))
 
         n_graphs = len(graph_data)
         print(f"[train] {n_graphs} valid graphs loaded, {epochs} epochs")
@@ -216,6 +211,9 @@ class LakeEmbedder:
         for ep in range(epochs):
             active = [i for i in range(n_graphs) if i not in oom_skip_idx]
             order = np.random.permutation(active)
+            # Per-epoch codebook-utilization accumulator (nearly free — the
+            # forward pass already computes indices, we just stop discarding them).
+            usage = torch.zeros(self.model.vq.codebook_size, dtype=torch.long)
             pbar = tqdm(order, desc=f"Epoch {ep+1}/{epochs}", unit="graph",
                         leave=False)
             ep_losses = []
@@ -227,7 +225,7 @@ class LakeEmbedder:
                 r = (torch.tensor(radii_arr, dtype=torch.float32, device=device)
                      if noise_scale != 0 else None)
                 try:
-                    _, decoded, _, _, commit_loss = self.model.forward(
+                    _, decoded, _, indices, commit_loss = self.model.forward(
                         edge_index.to(device),
                         radii=r,
                     )
@@ -236,6 +234,7 @@ class LakeEmbedder:
                         target_adj,
                         batch_size=recon_batch_size,
                     )
+                    usage += self.model.codebook_usage(indices)
                     # Scale the reconstruction term by 1/(i+1) for level i so
                     # denser reconstruction levels don't dominate the loss.
                     loss = recon_weight * edge_loss + commit_alpha * commit_loss
@@ -251,8 +250,14 @@ class LakeEmbedder:
                                      avg=f"{np.mean(ep_losses):.4f}")
 
                 except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
-                    is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or \
-                        ('out of memory' in str(exc).lower())
+                    # Only a genuine CUDA OOM on a CUDA device is skip-able.
+                    # The bare string sniff would also swallow a CPU-RAM or
+                    # non-CUDA "out of memory" failure — a real error that
+                    # must crash loudly, not silently drop a graph from
+                    # training for all remaining epochs.
+                    is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or (
+                        device.type == 'cuda'
+                        and 'out of memory' in str(exc).lower())
                     if not is_oom or not skip_oom:
                         raise
                     skipped_oom.append(str(key))
@@ -285,6 +290,7 @@ class LakeEmbedder:
                   f"avg loss: {np.mean(ep_losses):.4f} | "
                   f"min: {np.min(ep_losses):.4f} | "
                   f"max: {np.max(ep_losses):.4f}{best_str}")
+            print("    " + self.model.format_codebook_usage(usage, 'seq'))
 
             if save_path is not None:
                 torch.save(self.model.state_dict(), save_path)
@@ -312,29 +318,88 @@ class LakeEmbedder:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def embed(self, graph, lake_idx=None):
+    def _get_level_graphs(self, graph_entry, weighting='equal'):
+        """Resolve every reconstruction-level graph for an entry, each paired
+        with its level weight.
+
+        ``weighting``:
+          - 'equal'   → every level contributes 1.0 (uniform multi-scale
+                        average; maximizes codebook diversity — the denser
+                        levels count as much as the sparse one).
+          - 'spectral'→ the training ``recon_weight`` (marginal spectral mass,
+                        level 1 = 1.0; falls back to 1/(i+1) for old bundles),
+                        which keeps the sparse level dominant.
         """
-        Generate VQ code histogram embedding for a single graph.
+        graphs, _ = self._load_graph_entry(graph_entry)
+        if isinstance(graphs, (list, tuple)):
+            if not graphs:
+                raise ValueError("Encountered an empty graph list.")
+            level_list = graphs
+        else:
+            level_list = [graphs]
+        out = []
+        for i, g in enumerate(level_list):
+            if isinstance(g, dict) and g.get('degenerate'):
+                continue
+            if not hasattr(g, 'edge_index'):
+                raise TypeError("Graph entry must provide an edge_index tensor.")
+            if weighting == 'spectral':
+                w = getattr(g, 'recon_weight', None)
+                w = float(w) if w is not None else 1.0 / (i + 1)
+            else:
+                w = 1.0
+            out.append((g, w))
+        return out
+
+    def embed(self, graph_entry, lake_idx=None, weighting='equal'):
+        """
+        Generate a multi-scale VQ code histogram embedding for a graph entry.
+
+        The embedding is the weighted average of the code histograms of EVERY
+        reconstruction level (k=2/4/8/16).  The denser graphs aggregate more
+        context per gene and therefore assign genes to more codebook codes, so
+        using all levels exercises the full codebook.  ``weighting`` controls
+        how levels are combined:
+          - 'equal' (default, this experiment): all levels contribute 1.0 —
+            maximizes codebook diversity at the cost of diluting the sparse
+            level's identity signal.
+          - 'spectral': marginal-spectral-mass weights (level 1 = 1.0, the
+            training schedule) — keeps the sparse level dominant.
+        Deterministic: eval mode, no radii noise.
 
         Parameters
         ----------
-        graph : Data
-            Sparse graph (uses first reconstruction level if list).
+        graph_entry : Data or list[Data] or str
+            A reconstruction graph, a list of them (one per level), or a
+            bundle path.
         lake_idx : int or None
             Lake identity for conditioning.  REQUIRED for a jointly-trained
             model (which shifts gene representations by a learned per-lake
             vector before VQ discretization); passing None silently drops
             that conditioning.  Only meaningful when the model has lake_emb.
+        weighting : {'equal', 'spectral'}
+            Per-level weight schedule (default 'equal').
 
         Returns
         -------
         hist : np.ndarray (codebook_size,)
-            Normalized histogram over VQ codes.
+            Normalized histogram over VQ codes (sums to 1).
         """
         self.model.eval()
-        edge_index = graph.edge_index.to(self.device)
-        return self.model.get_codebook_histogram(
-            edge_index, lake_idx=lake_idx).cpu().numpy()
+        hist = None
+        total_w = 0.0
+        for graph, w in self._get_level_graphs(graph_entry, weighting=weighting):
+            edge_index = graph.edge_index.to(self.device)
+            h = self.model.get_codebook_histogram(
+                edge_index, lake_idx=lake_idx).cpu().numpy()
+            hist = h if hist is None else hist + w * h
+            total_w += w
+        if hist is None:
+            return (np.ones(self.model.vq.codebook_size, dtype=np.float32)
+                    / self.model.vq.codebook_size)
+        # w (Python float) × h (float32) promotes to float64 — cast back to
+        # float32 to match the previous embeddings' dtype.
+        return (hist / total_w).astype(np.float32)
 
     def _resolve_lake_idx(self, key, lake_name_to_id):
         """Resolve a lake index for a key, raising loudly if a joint model is
@@ -381,9 +446,8 @@ class LakeEmbedder:
             if _CGB.is_degenerate(graph_entry):
                 embeddings[key] = np.ones(codebook_size) / codebook_size
                 continue
-            graph, _ = self._get_primary_graph(graph_entry)
             lake_idx = self._resolve_lake_idx(key, lake_name_to_id)
-            embeddings[key] = self.embed(graph, lake_idx=lake_idx)
+            embeddings[key] = self.embed(graph_entry, lake_idx=lake_idx)
         return embeddings
 
     # ------------------------------------------------------------------
@@ -403,16 +467,20 @@ class LakeEmbedder:
         Build bidirectional gene ↔ VQ code lookup tables.
 
         For each stratification key, records which genes map to each
-        VQ code and which VQ codes each gene maps to.  For a jointly-trained
-        model, ``lake_name_to_id`` is required so the per-lake conditioning
-        learned at training time is applied here too (never silently dropped).
+        VQ code and which VQ codes each gene maps to — as the UNION over all
+        reconstruction levels, so codes that only fire on the denser graphs
+        still get gene lists (mirrors :meth:`embed`, which also uses all
+        levels).  A gene may map to several codes (one per level); that is
+        intended.  For a jointly-trained model, ``lake_name_to_id`` is
+        required so the per-lake conditioning learned at training time is
+        applied here too (never silently dropped).
 
         Returns
         -------
         vq_to_gene : dict {key: dict {vq_code: list[gene_idx]}}
-            For each key, maps VQ code → list of gene indices.
+            For each key, maps VQ code → sorted list of gene indices.
         gene_to_vq : dict {key: dict {gene_idx: list[vq_code]}}
-            For each key, maps gene index → list of VQ codes.
+            For each key, maps gene index → sorted list of VQ codes.
         """
         vq_to_gene = {}
         gene_to_vq = {}
@@ -425,20 +493,24 @@ class LakeEmbedder:
                 vq_to_gene[key] = {}
                 gene_to_vq[key] = {}
                 continue
-            graph, _ = self._get_primary_graph(graph_entry)
             lake_idx = self._resolve_lake_idx(key, lake_name_to_id)
-            assign = self._get_assignments(graph, lake_idx=lake_idx)
-
-            vq_to_gene[key] = defaultdict(list)
-            gene_to_vq[key] = defaultdict(list)
-
-            for gene_idx, code in enumerate(assign):
-                vq_to_gene[key][code].append(gene_idx)
-                gene_to_vq[key][gene_idx].append(code)
-
-            # Convert defaultdicts to regular dicts
-            vq_to_gene[key] = dict(vq_to_gene[key])
-            gene_to_vq[key] = dict(gene_to_vq[key])
+            # Union gene↔code assignments across ALL reconstruction levels:
+            # the denser graphs assign genes to more codes, so restricting the
+            # mapping to the primary (k=2) graph starved most codes of gene
+            # lists and the VQ↔WGCNA overlap had nothing to test.  A gene may
+            # now map to multiple codes (one per level) — that is intended.
+            vq_to_gene[key] = defaultdict(set)
+            gene_to_vq[key] = defaultdict(set)
+            for graph, _w in self._get_level_graphs(graph_entry):
+                assign = self._get_assignments(graph, lake_idx=lake_idx)
+                for gene_idx, code in enumerate(assign):
+                    vq_to_gene[key][code].add(gene_idx)
+                    gene_to_vq[key][gene_idx].add(code)
+            # Convert sets → sorted lists (keeps output type stable).
+            vq_to_gene[key] = {c: sorted(gs)
+                               for c, gs in vq_to_gene[key].items()}
+            gene_to_vq[key] = {g: sorted(cs)
+                               for g, cs in gene_to_vq[key].items()}
 
         return vq_to_gene, gene_to_vq
 

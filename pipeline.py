@@ -143,8 +143,11 @@ def _save_model_kwargs(output_dir, model_filename, n_genes, cfg, n_lakes):
         output_dir,
         model_filename.replace('.pt', '_kwargs.pkl')
     )
-    if os.path.exists(kwargs_path):
-        return  # already saved
+    # Always overwrite: a stale kwargs file (e.g. from a --force retrain with
+    # a different n_genes / codebook_size) would make Modal workers rebuild
+    # the model with the WRONG architecture — a silent shape mismatch or,
+    # worse, a coincidentally-valid but wrong model.  The kwargs must describe
+    # the model this run actually saves.
     kwargs = {
         'n_nodes': n_genes,
         'in_channels': cfg.get('in_channels', 64),
@@ -229,6 +232,36 @@ def step_batch_correct(args):
 
     # Check if already done — look for the pipeline-ready combined CSV
     if not args.force and os.path.exists(pipeline_csv):
+        # A cached combined CSV from an earlier run may carry duplicate
+        # Fish_ID rows (metadata/morphology merge explosion in
+        # batch_correct_hk).  Clean them in place — cheap, and avoids
+        # re-running ComBat.  IDENTICAL duplicates are deduped; fish with
+        # CONFLICTING duplicates (differing values, e.g. in both cohorts)
+        # are EXCLUDED entirely (user-approved handling).
+        import pandas as _pd
+        _bc = _pd.read_csv(pipeline_csv)
+        if _bc['Fish_ID'].duplicated().any():
+            _dup_ids = sorted(
+                set(_bc.loc[_bc['Fish_ID'].duplicated(keep=False),
+                            'Fish_ID']))
+            _identical, _conflicting = [], []
+            for _fid in _dup_ids:
+                _rows = _bc[_bc['Fish_ID'] == _fid]
+                (_conflicting if _rows.drop_duplicates().shape[0] > 1
+                 else _identical).append(_fid)
+            if _conflicting:
+                print(f"[Step 0] EXCLUDING {len(_conflicting)} fish with "
+                      f"conflicting duplicate rows: {_conflicting} — assigned "
+                      f"to both source and recipient cohorts / differing "
+                      f"values; dropping ALL copies.")
+                _bc = _bc[~_bc['Fish_ID'].isin(_conflicting)]
+            if _identical:
+                _n = int(_bc[_bc['Fish_ID'].isin(_identical)]
+                         ['Fish_ID'].duplicated().sum())
+                _bc = _bc.drop_duplicates(subset=['Fish_ID'], keep='first')
+                print(f"[Step 0] Removed {_n} identical duplicate Fish_ID "
+                      f"row(s) from cached pipeline CSV: {_identical}")
+            _bc.to_csv(pipeline_csv, index=False)
         print("[Step 0] Batch correction already done, skipping.")
         print(f"  Using: {pipeline_csv}")
         return pipeline_csv
@@ -259,25 +292,45 @@ def step_load_data(args, cfg):
     matrices_path = checkpoint_path(args.output_dir, 'matrices.pkl')
     data_path = checkpoint_path(args.output_dir, 'data.pkl')
 
+    # When --batch-correct ran, args.transcriptome points at the log2(CPM+1)
+    # ComBat CSV — tell the loader so it inverts to linear before row-normalizing.
+    input_scale = 'log2cpm' if getattr(args, 'batch_correct', False) else 'linear'
+
+    # The matrices cache must invalidate on ANY input that changes the data:
+    # the input scale (linear vs log2cpm — toggling --batch-correct silently
+    # reuses the wrong-scaled matrices otherwise), the data-file paths, and
+    # the gene-filter params (they change the persisted gene set below).
+    cache_fingerprint = {
+        'input_scale': input_scale,
+        'transcriptome': args.transcriptome,
+        'metadata': args.metadata,
+        'morphology': args.morphology or None,
+        'infection': args.infection or None,
+        'top_n_genes': args.top_n_genes,
+        'min_expression': args.min_expression,
+    }
+
     if not args.force and exists(matrices_path) and exists(data_path):
         cached = load_pickle(matrices_path)
         if isinstance(cached, dict) and '__meta__' in cached:
-            cached_strats = cached['__meta__'].get('stratifications', [])
-            if set(cached_strats) == set(cfg['stratifications']):
+            meta = cached['__meta__']
+            cached_strats = meta.get('stratifications', [])
+            cached_fp = meta.get('cache_fingerprint', {})
+            if (set(cached_strats) == set(cfg['stratifications'])
+                    and cached_fp == cache_fingerprint):
                 print("[Step 1] Loading cached matrices and data...")
                 del cached['__meta__']
                 return cached, load_pickle(data_path)
-            print(f"[Step 1] Cached stratifications {cached_strats} "
-                  f"differ from current {cfg['stratifications']} — rebuilding")
+            print(f"[Step 1] Cached matrices mismatch current inputs "
+                  f"(stratifications {cached_strats} vs "
+                  f"{cfg['stratifications']}; fingerprint {cached_fp} vs "
+                  f"{cache_fingerprint}) — rebuilding")
         elif isinstance(cached, dict):
             # Backward-compatible: old cache without metadata, assume valid
             print("[Step 1] Loading cached matrices and data (legacy)...")
             return cached, load_pickle(data_path)
 
     print("[Step 1] Loading CSVs and building expression matrices...")
-    # When --batch-correct ran, args.transcriptome points at the log2(CPM+1)
-    # ComBat CSV — tell the loader so it inverts to linear before row-normalizing.
-    input_scale = 'log2cpm' if getattr(args, 'batch_correct', False) else 'linear'
     sd = SticklebackData(
         transcriptome_path=args.transcriptome,
         metadata_path=args.metadata,
@@ -300,7 +353,10 @@ def step_load_data(args, cfg):
             )
         matrices.update(by_matrices)
 
-    save_pickle({**matrices, '__meta__': {'stratifications': cfg['stratifications']}}, matrices_path)
+    save_pickle({**matrices, '__meta__': {
+        'stratifications': cfg['stratifications'],
+        'cache_fingerprint': cache_fingerprint,
+    }}, matrices_path)
     save_pickle(sd, data_path)
     print(f"  Saved {len(matrices)} matrices to {matrices_path}")
     return matrices, sd
@@ -340,14 +396,19 @@ def step_build_graphs(args, cfg, matrices):
                         break
                 if sample_val is not None:
                     # Resolve actual graph to get num_nodes
+                    stored_hash = ''
                     if isinstance(sample_val, (str, os.PathLike)):
-                        g = _torch.load(os.fspath(sample_val),
-                                        map_location='cpu',
-                                        weights_only=False)
-                        if isinstance(g, dict) and 'graphs' in g:
-                            g = g['graphs'][0]
-                        elif isinstance(g, (list, tuple)):
-                            g = g[0]
+                        payload = _torch.load(os.fspath(sample_val),
+                                              map_location='cpu',
+                                              weights_only=False)
+                        stored_hash = (payload.get('config_hash', '')
+                                       if isinstance(payload, dict) else '')
+                        if isinstance(payload, dict) and 'graphs' in payload:
+                            g = payload['graphs'][0]
+                        elif isinstance(payload, (list, tuple)):
+                            g = payload[0]
+                        else:
+                            g = payload
                     elif isinstance(sample_val, (list, tuple)):
                         g = sample_val[0]
                     else:
@@ -355,9 +416,25 @@ def step_build_graphs(args, cfg, matrices):
                     cached_n = (g.num_nodes if hasattr(g, 'num_nodes')
                                 else g.x.shape[0] if hasattr(g, 'x')
                                 else g.edge_index.max().item() + 1)
-                    if cached_n != expected_n:
-                        print(f"[Step 2] Cached graphs have {cached_n} nodes, "
-                              f"expected {expected_n} — rebuilding")
+                    # The cache key covers the adjacency construction method
+                    # (graphs.ADJACENCY_METHOD_VERSION).  A hash mismatch means
+                    # these bundles were built with different adjacency math
+                    # (e.g. pre-CLR) — silently reusing them would serve stale
+                    # graphs for the whole rerun, so rebuild.
+                    expected_hash = _CGB._config_hash(
+                        cfg.get('n_eigencomponents', 128),
+                        cfg.get('reconstruction_levels', [4, 8, 32, 64, 127]),
+                        cfg.get('target_density', 0.01),
+                    )
+                    if cached_n != expected_n or stored_hash != expected_hash:
+                        if cached_n != expected_n:
+                            print(f"[Step 2] Cached graphs have {cached_n} "
+                                  f"nodes, expected {expected_n} — rebuilding")
+                        if stored_hash != expected_hash:
+                            print(f"[Step 2] Cached graph bundle config hash "
+                                  f"{stored_hash!r} != expected "
+                                  f"{expected_hash!r} — adjacency method or "
+                                  f"graph params changed; rebuilding")
                         args.force = True  # force rebuild for this step
                         # fall through to rebuild below
                     else:
@@ -463,8 +540,11 @@ def step_build_graphs(args, cfg, matrices):
             if os.path.exists(radii_sidecar):
                 try:
                     existing_radii[key] = np.load(radii_sidecar)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Silent fallback to `ones` radii would corrupt the noise
+                    # signal for every recovered graph.  Report loudly.
+                    print(f"  WARNING: could not load radii sidecar for "
+                          f"{basename}: {exc}. Rebuilding this key's radii.")
             found += 1
         if found > 0:
             print(f"[Step 2] Found {found} existing graph bundles on disk "
@@ -499,6 +579,101 @@ def step_build_graphs(args, cfg, matrices):
     # _validate_graphs(graphs, label="freshly built graphs", graphs_dir=graphs_dir)
 
     return graphs, radii
+
+
+def _apply_gene_filter(args, cfg, matrices, sd):
+    """Apply the optional two-stage gene filter in place.
+
+    Stage 1: drop genes whose pooled mean relative abundance < min_expression.
+    Stage 2: keep the top ``top_n_genes`` by CLR-scale variance.
+
+    Mutates ``matrices`` (column subset), ``sd.gene_names``/``sd.n_genes`` and
+    ``cfg['n_genes']``; returns ``(matrices, sd)``.
+
+    CRITICAL ORDERING: this MUST run BEFORE graphs are constructed.  The
+    graphs and the model must share the same gene set.  (Previously it ran
+    after ``step_build_graphs``, so graphs kept the full gene set while
+    ``cfg['n_genes']`` was filtered — the model's node embedding was then too
+    small and SAGEConv crashed with an opaque node-index error on the first
+    forward pass.)
+    """
+    do_expression_filter = args.min_expression > 0
+    # top_n_genes <= 0 (including 0) means "no variance filter — keep ALL
+    # genes", matching the documented CLI semantics ("set to 0 for all").
+    # Without the `> 0` guard, --top-n-genes 0 selected ZERO genes.
+    do_variance_filter = (
+        args.top_n_genes is not None
+        and args.top_n_genes > 0
+        and args.top_n_genes < cfg['n_genes']
+    )
+    if not (do_expression_filter or do_variance_filter):
+        return matrices, sd
+
+    # Pool expression data across all matrices for gene-level statistics
+    all_expr = []
+    for M in matrices.values():
+        if hasattr(M, 'shape') and M.shape[0] > 0:
+            all_expr.append(np.asarray(M, dtype=np.float64))
+    pooled = np.vstack(all_expr) if all_expr else None
+
+    if pooled is None:
+        print("  WARNING: No expression data to filter — skipping")
+        return matrices, sd
+
+    n_original = pooled.shape[1]
+    gene_means = np.mean(pooled, axis=0)
+    gene_vars = np.var(pooled, axis=0)
+    keep_mask = np.ones(n_original, dtype=bool)
+
+    # --- Stage 1: expression filter ---
+    if do_expression_filter:
+        expr_keep = gene_means >= args.min_expression
+        n_removed = int((~expr_keep).sum())
+        keep_mask &= expr_keep
+        print(f"\n  Stage 1 (expression filter): removed {n_removed} "
+              f"genes with mean < {args.min_expression:.2e} "
+              f"({100*n_removed/n_original:.1f}%)")
+        print(f"    Surviving: {int(keep_mask.sum())} genes "
+              f"(mean range: {gene_means[keep_mask].min():.2e} – "
+              f"{gene_means[keep_mask].max():.2e})")
+
+    # --- Stage 2: variance filter ---
+    if do_variance_filter:
+        surviving_idx = np.where(keep_mask)[0]
+        n_surviving = len(surviving_idx)
+        if args.top_n_genes >= n_surviving:
+            print(f"  Stage 2 (variance filter): --top-n-genes "
+                  f"({args.top_n_genes}) >= surviving genes "
+                  f"({n_surviving}) — keeping all")
+        else:
+            # Rank surviving genes by variance (descending)
+            surv_vars = gene_vars[surviving_idx]
+            var_order = np.argsort(surv_vars)[::-1]
+            top_surviving = surviving_idx[var_order[:args.top_n_genes]]
+            new_mask = np.zeros(n_original, dtype=bool)
+            new_mask[top_surviving] = True
+            keep_mask = new_mask
+            print(f"  Stage 2 (variance filter): kept top "
+                  f"{args.top_n_genes} genes by variance "
+                  f"(variance range: "
+                  f"{gene_vars[keep_mask].min():.2e} – "
+                  f"{gene_vars[keep_mask].max():.2e})")
+
+    # --- Apply mask to all matrices ---
+    final_idx = np.where(keep_mask)[0]
+    final_idx = np.sort(final_idx)
+    print(f"  Final gene set: {len(final_idx)}/{n_original} "
+          f"({100*len(final_idx)/n_original:.1f}%)")
+
+    for key in tqdm(list(matrices.keys()), desc="  Subsetting matrices"):
+        M = np.asarray(matrices[key])
+        matrices[key] = M[:, final_idx]
+
+    if sd is not None:
+        sd.gene_names = [sd.gene_names[i] for i in final_idx]
+        sd.n_genes = len(final_idx)
+    cfg['n_genes'] = len(final_idx)
+    return matrices, sd
 
 
 # ---------------------------------------------------------------------------
@@ -577,21 +752,25 @@ def _preload_all_graphs(graphs, radii, noise_scale, lake_name_to_id=None):
         scaled = r * float(noise_scale) if noise_scale != 0 else r.copy()
 
         # Train on EVERY reconstruction level (densities ramp 1% → 2% → …).
-        # Level i (0-based) covers (i+1)% of edges, so its reconstruction
-        # loss is divided by (i+1) to keep levels balanced.
+        # Level i (0-based) carries its principled marginal-spectral-mass
+        # weight (graphs.py, normalized so the 1% level is 1.0); falls back to
+        # 1/(i+1) for old bundles without it.
         lake_name = str(key).split(' (')[0]
         for i, graph in enumerate(graph_list):
+            _w = getattr(graph, 'recon_weight', None)
+            if _w is None:
+                _w = 1.0 / (i + 1)
             # Joint format
             list_of_edge_indices.append(graph.edge_index)
             list_of_target_adjs.append(graph.target_adj)
             radii_list.append(r * float(noise_scale) if noise_scale != 0 else r.copy())
-            recon_weights_list.append(1.0 / (i + 1))
+            recon_weights_list.append(_w)
             if lake_name_to_id is not None:
                 lake_ids_list.append(lake_name_to_id[lake_name])
 
             # Sequential format
             seq_data.append((key, graph.edge_index, graph.target_adj,
-                             scaled, 1.0 / (i + 1)))
+                             scaled, _w))
 
     if skipped_degenerate:
         print(f"  Skipped {len(skipped_degenerate)} degenerate graph(s): "
@@ -607,7 +786,7 @@ def _preload_all_graphs(graphs, radii, noise_scale, lake_name_to_id=None):
 
 
 def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
-                          all_keys, batch_size):
+                          all_keys, batch_size, train_joint=True):
     """Train sequential and joint models with batched graph loading.
 
     Graphs are loaded from disk in batches of ``batch_size`` to keep CPU
@@ -645,24 +824,15 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
     #     decoder_channels=cfg.get('decoder_channels', 256),
     #     n_lakes=None,
     # )
-    joint_model = _build_vqgnn(cfg, n_genes, n_lakes=n_lakes)
-    # ORIGINAL (uncomment if _build_vqgnn breaks):
-    # joint_model = VQGNN(
-    #     n_nodes=n_genes,
-    #     in_channels=cfg.get('in_channels', 64),
-    #     hidden_channels=cfg.get('hidden_channels', 64),
-    #     out_channels=cfg.get('out_channels', 16),
-    #     num_layers=cfg.get('num_layers', 3),
-    #     dropout=cfg.get('dropout', 0.3),
-    #     codebook_channels=cfg.get('codebook_channels', 16),
-    #     codebook_size=cfg.get('codebook_size', 100),
-    #     decoder_channels=cfg.get('decoder_channels', 256),
-    #     n_lakes=n_lakes,
-    # )
+    # train_joint=False → sequential-only batched training (the sequential
+    # single-paradigm path).  The joint model is skipped entirely.
+    joint_model = (_build_vqgnn(cfg, n_genes, n_lakes=n_lakes)
+                   if train_joint else None)
     seq_model.to(device)
-    joint_model.to(device)
     print(f"[batched] Seq model device: {next(seq_model.parameters()).device}")
-    print(f"[batched] Joint model device: {next(joint_model.parameters()).device}")
+    if joint_model is not None:
+        joint_model.to(device)
+        print(f"[batched] Joint model device: {next(joint_model.parameters()).device}")
 
     # Save model kwargs for reproducibility
     seq_path = checkpoint_path(args.output_dir, 'model.pt')
@@ -680,15 +850,18 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
     joint_loss_path = joint_path.replace('.pt', '_loss.pkl')
     meta_path = checkpoint_path(args.output_dir, 'train_meta.pkl')
     _save_model_kwargs(args.output_dir, 'model.pt', n_genes, cfg, None)
-    _save_model_kwargs(args.output_dir, 'model_joint.pt', n_genes, cfg, n_lakes)
+    if train_joint:
+        _save_model_kwargs(args.output_dir, 'model_joint.pt', n_genes, cfg,
+                           n_lakes)
 
     # ------------------------------------------------------------------
     # Persistent optimizers (state survives across batches & epochs)
     # ------------------------------------------------------------------
     seq_opt = torch.optim.Adam(seq_model.parameters(), lr=args.lr,
                                 weight_decay=1e-4)
-    joint_opt = torch.optim.Adam(joint_model.parameters(), lr=args.lr,
+    joint_opt = (torch.optim.Adam(joint_model.parameters(), lr=args.lr,
                                   weight_decay=1e-4)
+                 if train_joint else None)
 
     # AMP: bf16 autocast (same range as fp32 → no GradScaler needed).
     use_amp = args.device != 'cpu'
@@ -717,11 +890,15 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
     # ------------------------------------------------------------------
     start_epoch = 0
     if getattr(args, 'resume', False):
-        for which, model, mpath_best, mpath_last, opt, opath, lp in (
-                ('seq', seq_model, seq_path, seq_last_path,
-                 seq_opt, seq_opt_path, seq_loss_path),
+        _resume_models = [
+            ('seq', seq_model, seq_path, seq_last_path,
+             seq_opt, seq_opt_path, seq_loss_path),
+        ]
+        if train_joint:
+            _resume_models.append(
                 ('joint', joint_model, joint_path, joint_last_path,
-                 joint_opt, joint_opt_path, joint_loss_path)):
+                 joint_opt, joint_opt_path, joint_loss_path))
+        for which, model, mpath_best, mpath_last, opt, opath, lp in _resume_models:
 
             # 1. Seed best-epoch tracking from the prior BEST checkpoint so a
             #    resume that fails to improve preserves the old best epoch.
@@ -802,13 +979,37 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
             # BEST epoch.  Downstream steps run on whatever we return, so load
             # the best checkpoints here — otherwise a no-op resume would send
             # last-epoch weights downstream that differ from model.pt on disk.
-            for m, path in ((seq_model, seq_path), (joint_model, joint_path)):
+            _load_best = [(seq_model, seq_path)]
+            if train_joint:
+                _load_best.append((joint_model, joint_path))
+            for m, path in _load_best:
                 if exists(path):
                     m.load_state_dict(torch.load(
                         path, map_location=device, weights_only=True))
             return seq_model, joint_model
         print(f"[batched] Resuming: training epochs {start_epoch + 1}.."
               f"{args.epochs} (continuing from {start_epoch} completed)")
+
+    # Checkpoint contract: the rest of the pipeline skips a step when its
+    # artifact exists unless --force.  The batched path must do the same, or a
+    # rerun WITHOUT --force silently retrains fresh models while downstream
+    # steps (step_generate_embeddings etc.) reuse the OLD embeddings from disk
+    # — pairing a new model with stale artifacts.  Skip training (load the
+    # best checkpoints) when the requested models already exist and we're not
+    # forcing.
+    if (not args.force and not args.resume and exists(seq_path)
+            and (not train_joint or exists(joint_path))):
+        print("[batched] Existing best checkpoints present and not "
+              "--force/--resume — loading, skipping training "
+              "(pass --force to retrain).")
+        _load_best = [(seq_model, seq_path)]
+        if train_joint:
+            _load_best.append((joint_model, joint_path))
+        for m, path in _load_best:
+            if exists(path):
+                m.load_state_dict(torch.load(
+                    path, map_location=device, weights_only=True))
+        return seq_model, joint_model
 
     # ------------------------------------------------------------------
     # Training loop: epochs → batches → graphs
@@ -876,15 +1077,17 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
             # dominate (their MSE is naturally larger).
             lake_name = str(key).split(' (')[0]
             for i, g in enumerate(graph_list):
+                _w = getattr(g, 'recon_weight', None)
+                if _w is None:
+                    _w = 1.0 / (i + 1)
                 list_of_edge_indices.append(g.edge_index)
                 list_of_target_adjs.append(g.target_adj)
                 radii_list_joint.append(
                     r * float(args.noise_scale) if args.noise_scale != 0 else r.copy())
-                recon_weights_joint.append(1.0 / (i + 1))
+                recon_weights_joint.append(_w)
                 if lake_name_to_id is not None:
                     lake_ids_list.append(lake_name_to_id[lake_name])
-                seq_data.append((g.edge_index, g.target_adj, scaled,
-                                 1.0 / (i + 1)))
+                seq_data.append((g.edge_index, g.target_adj, scaled, _w))
 
         return (list_of_edge_indices, list_of_target_adjs,
                 radii_list_joint, lake_ids_list, recon_weights_joint,
@@ -921,6 +1124,10 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
         ep_seq_commit = []
         ep_joint_edge = []
         ep_joint_commit = []
+        # Per-epoch codebook-utilization accumulators (nearly free — the
+        # forward pass already computes indices, we just stop discarding them).
+        usage_seq = torch.zeros(args.codebook_size, dtype=torch.long)
+        usage_joint = torch.zeros(args.codebook_size, dtype=torch.long)
 
         for bi in pbar:
             # Wait for this batch to finish loading
@@ -956,14 +1163,14 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
                                  device=device)
                     if args.noise_scale != 0 else None)
                 edge_index_gpu = edge_index.to(device)
-
-                # bf16 autocast: same range as fp32 → no GradScaler needed.
+           # bf16 autocast: same range as fp32 → no GradScaler needed.
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16,
                                         enabled=use_amp):
-                    _, decoded, _, _, commit_loss = seq_model.forward(
+                    _, decoded, _, indices_seq, commit_loss = seq_model.forward(
                         edge_index_gpu, radii=r_tensor)
                     edge_loss = seq_model.reconstruction_loss(
                         decoded, target_adj, batch_size=recon_batch_size)
+                usage_seq += seq_model.codebook_usage(indices_seq)
                 # Multi-scale rebalancing: reconstruction level i (0-based)
                 # gets its naturally larger MSE divided by (i+1).
                 loss = recon_weight * edge_loss + args.commit_alpha * commit_loss
@@ -975,53 +1182,57 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
                 batch_seq_edge.append(edge_loss.item())
                 batch_seq_commit.append(commit_loss.item())
 
-            # ---- Train joint on batch -------------------------------
-            joint_model.train()
-            batch_joint_edge = []
-            batch_joint_commit = []
-            for i in range(n_loaded):
-                edge_index_gpu = list_of_edge_indices[i].to(device)
-                target_adj = list_of_target_adjs[i]
-                lake_idx = (
-                    lake_ids_list[i] if lake_ids_list else i)
+            # ---- Train joint on batch (skipped for sequential-only) ----
+            if train_joint:
+                joint_model.train()
+                batch_joint_edge = []
+                batch_joint_commit = []
+                for i in range(n_loaded):
+                    edge_index_gpu = list_of_edge_indices[i].to(device)
+                    target_adj = list_of_target_adjs[i]
+                    lake_idx = (
+                        lake_ids_list[i] if lake_ids_list else i)
 
-                r_tensor = None
-                # --noise-scale 0 must DISABLE joint noise too: without this
-                # check, the unscaled radii were still injected (the sequential
-                # path already guarded on noise_scale != 0, the joint path did
-                # not).
-                if radii_list_joint and args.noise_scale != 0:
-                    r_tensor = torch.tensor(
-                        radii_list_joint[i], dtype=torch.float32,
-                        device=device)
+                    r_tensor = None
+                    # --noise-scale 0 must DISABLE joint noise too: without
+                    # this check, the unscaled radii were still injected (the
+                    # sequential path already guarded on noise_scale != 0, the
+                    # joint path did not).
+                    if radii_list_joint and args.noise_scale != 0:
+                        r_tensor = torch.tensor(
+                            radii_list_joint[i], dtype=torch.float32,
+                            device=device)
 
-                # bf16 autocast: same range as fp32 → no GradScaler needed.
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16,
-                                        enabled=use_amp):
-                    _, decoded, _, _, commit_loss = joint_model.forward(
-                        edge_index_gpu, radii=r_tensor, lake_idx=lake_idx)
-                    edge_loss = joint_model.reconstruction_loss(
-                        decoded, target_adj, batch_size=recon_batch_size)
-                # Multi-scale rebalancing: reconstruction level i (0-based)
-                # gets its naturally larger MSE divided by (i+1).
-                loss = recon_weights_joint[i] * edge_loss + \
-                    args.commit_alpha * commit_loss
+                    # bf16 autocast: same range as fp32 → no GradScaler needed.
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16,
+                                            enabled=use_amp):
+                        _, decoded, _, indices_joint, commit_loss = joint_model.forward(
+                            edge_index_gpu, radii=r_tensor, lake_idx=lake_idx)
+                        edge_loss = joint_model.reconstruction_loss(
+                            decoded, target_adj, batch_size=recon_batch_size)
+                    usage_joint += joint_model.codebook_usage(indices_joint)
+                    # Multi-scale rebalancing: reconstruction level i (0-based)
+                    # gets its naturally larger MSE divided by (i+1).
+                    loss = recon_weights_joint[i] * edge_loss + \
+                        args.commit_alpha * commit_loss
 
-                joint_opt.zero_grad()
-                loss.backward()
-                joint_opt.step()
+                    joint_opt.zero_grad()
+                    loss.backward()
+                    joint_opt.step()
 
-                batch_joint_edge.append(edge_loss.item())
-                batch_joint_commit.append(commit_loss.item())
+                    batch_joint_edge.append(edge_loss.item())
+                    batch_joint_commit.append(commit_loss.item())
 
             ep_seq_edge.extend(batch_seq_edge)
             ep_seq_commit.extend(batch_seq_commit)
-            ep_joint_edge.extend(batch_joint_edge)
-            ep_joint_commit.extend(batch_joint_commit)
+            if train_joint:
+                ep_joint_edge.extend(batch_joint_edge)
+                ep_joint_commit.extend(batch_joint_commit)
 
             pbar.set_postfix(
                 seq=f"{np.mean(batch_seq_edge):.4f}" if batch_seq_edge else "N/A",
-                joint=f"{np.mean(batch_joint_edge):.4f}" if batch_joint_edge else "N/A",
+                joint=(f"{np.mean(batch_joint_edge):.4f}"
+                       if train_joint and batch_joint_edge else "N/A"),
             )
 
             # Free batch memory: dropping references lets the caching
@@ -1035,9 +1246,11 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
             # optimizer together so a resumed run continues with consistent
             # Adam momentum.  model.pt (best epoch) is written once at the end.
             torch.save(seq_model.state_dict(), seq_last_path)
-            torch.save(joint_model.state_dict(), joint_last_path)
+            if train_joint:
+                torch.save(joint_model.state_dict(), joint_last_path)
             torch.save(seq_opt.state_dict(), seq_opt_path)
-            torch.save(joint_opt.state_dict(), joint_opt_path)
+            if train_joint:
+                torch.save(joint_opt.state_dict(), joint_opt_path)
 
         # ---- End-of-epoch summary + best-epoch tracking ---------------
         # Criterion = mean(edge_loss) + 0.1 * mean(commit_loss).
@@ -1048,7 +1261,7 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
             if seq_crit < best['seq']['crit']:
                 best['seq'] = {'state': _snapshot(seq_model), 'crit': seq_crit,
                                'edge': seq_e, 'commit': seq_c, 'epoch': ep + 1}
-        if ep_joint_edge:
+        if train_joint and ep_joint_edge:
             joint_e = float(np.mean(ep_joint_edge))
             joint_c = float(np.mean(ep_joint_commit))
             joint_crit = joint_e + 0.1 * joint_c
@@ -1067,6 +1280,10 @@ def _train_models_batched(args, cfg, graphs, radii, lake_name_to_id, n_lakes,
         print(f"  Epoch {ep+1}/{args.epochs} | "
               f"seq {seq_edge_str} {seq_commit_str}{seq_best} | "
               f"joint {joint_edge_str} {joint_commit_str}{joint_best}")
+        print("    " + seq_model.format_codebook_usage(usage_seq, 'seq'))
+        if train_joint:
+            print("    " + joint_model.format_codebook_usage(
+                usage_joint, 'joint'))
 
         # Record completed epochs so a future --resume knows where to pick up.
         save_pickle({'completed_epochs': ep + 1}, meta_path)
@@ -1246,10 +1463,13 @@ def step_train_model(args, cfg, graphs, radii, preloaded=None):
                 # levels don't dominate.
                 lake_name = str(key).split(' (')[0]
                 for i, graph in enumerate(graph_list):
+                    _w = getattr(graph, 'recon_weight', None)
+                    if _w is None:
+                        _w = 1.0 / (i + 1)
                     list_of_edge_indices.append(graph.edge_index)
                     list_of_target_adjs.append(graph.target_adj)
                     radii_list.append(r)
-                    recon_weights_list.append(1.0 / (i + 1))
+                    recon_weights_list.append(_w)
                     lake_ids_list.append(lake_name_to_id[lake_name])
 
             if skipped_degenerate:
@@ -1545,8 +1765,9 @@ def step_label_permutation(args, embeddings, sd):
 # Step 9: Generate figures
 # ---------------------------------------------------------------------------
 
-def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
-                          label_perm, model=None):
+def step_generate_figures(args, embeddings, sd, mappings,
+                          # slopes, clustering, label_perm,  # unused (dead-code audit)
+                          model=None):
     from surge.analysis import LakeAnalyzer
     from surge.plotting import LakePlotter
     import matplotlib
@@ -1672,22 +1893,37 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
         print(f"    Saved pca_genotype_{strat}.png")
 
         # -- Wasserstein temporal grid (per-stratification) --
-        sub_wass = sub.wasserstein_temporal_or_skip(base_year=args.base_year)
-        if sub_wass:
+        # year_lake → one lake-level grid.  sex/infection → one grid PER STATUS:
+        # the per-lake temporal series is only well-defined within a single
+        # status, because suffixed keys ('Lake (2021)-f' / '-m') collide at
+        # (lake, year) if merged.
+        if strat == 'sex_year_lake':
+            status_suffixes = ['-f', '-m']
+        elif strat == 'infection_year_lake':
+            status_suffixes = ['-0', '-1']
+        else:
+            status_suffixes = [None]
+
+        for suffix in status_suffixes:
+            sub_wass = sub.wasserstein_temporal_or_skip(
+                base_year=args.base_year, suffix=suffix)
+            if not sub_wass:
+                continue
             sub_wass_scaled, sub_p95 = LakeAnalyzer.scale_wasserstein_p95(sub_wass)
             n_lakes = len(sub_wass_scaled)
             # Source vs Recipient slope test for this stratification
             sub_slope = sub.source_vs_recipient_slope_test(sub_wass)
             t_p = sub_slope.get('ttest_pvalue')
             mw_p = sub_slope.get('mannwhitney_pvalue')
+            suffix_label = f" ({suffix.lstrip('-')})" if suffix else ""
             if t_p is not None and mw_p is not None:
-                sub_sup = (f"Wasserstein Temporal Drift — {strat}\n"
+                sub_sup = (f"Wasserstein Temporal Drift — {strat}{suffix_label}\n"
                            f"Source vs Recipient: t-test p={t_p:.4f}, "
                            f"Mann-Whitney p={mw_p:.4f}")
             else:
                 n_src = len(sub_slope.get('source_slopes', []))
                 n_rcp = len(sub_slope.get('recipient_slopes', []))
-                sub_sup = (f"Wasserstein Temporal Drift — {strat}\n"
+                sub_sup = (f"Wasserstein Temporal Drift — {strat}{suffix_label}\n"
                            f"(insufficient data: {n_src} Source, "
                            f"{n_rcp} Recipient lakes)")
             fig = LakePlotter.wasserstein_grid(
@@ -1697,11 +1933,12 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                 figsize=(min(16, n_lakes * 4), max(6, n_lakes * 0.75)),
                 suptitle=sub_sup,
             )
-            fig.savefig(os.path.join(figures_dir, f'wasserstein_grid_{strat}.png'),
+            fname = (f'wasserstein_grid_{strat}'
+                     + (f'_{suffix.lstrip("-")}' if suffix else '') + '.png')
+            fig.savefig(os.path.join(figures_dir, fname),
                         dpi=300, bbox_inches='tight')
             plt.close(fig)
-            print(f"    Saved wasserstein_grid_{strat}.png "
-                  f"(P95={sub_p95:.6f}, {n_lakes} lakes)")
+            print(f"    Saved {fname} (P95={sub_p95:.6f}, {n_lakes} lakes)")
 
         # -- Dendrogram --
         sub_clust = sub.hierarchical_clustering(
@@ -1922,13 +2159,25 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                     # low-but-real signals (sex, role) also produce gene lists
                     # for g:Profiler and WGCNA overlap.  FDR q-values are still
                     # written to the CSV for the enrichment pipeline to use.
-                    sig_codes = [
-                        (code, r) for code, r in code_enrich.items()
-                        if r.get('p_value', 1.0) < 0.05
-                    ]
+                    # Export gene lists for ALL codes that have genes (not just
+                    # p<0.05): the VQ↔WGCNA overlap and g:Profiler steps need
+                    # the gene lists regardless of significance.  With only a
+                    # p<0.05 gate, a run with no significant codes (e.g. a
+                    # collapsed codebook) silently exported nothing and the
+                    # WGCNA overlap steps were skipped entirely.
+                    sig_codes = []
+                    if mappings:
+                        for code, r in code_enrich.items():
+                            genes = set()
+                            for key in (set(sub.keys) &
+                                        set(mappings['vq_to_gene'].keys())):
+                                genes.update(
+                                    mappings['vq_to_gene'][key].get(code, []))
+                            if genes:
+                                sig_codes.append((code, r, sorted(genes)))
                     sig_codes.sort(key=lambda x: x[1].get('q_value',
                                                            x[1]['p_value']))
-                    if sig_codes and mappings:
+                    if sig_codes:
                         go_path = os.path.join(
                             figures_dir, 'infection_genes_for_go.csv')
                         import csv
@@ -1938,13 +2187,7 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                                 ['vq_code', 'p_value', 'q_value', 'fold_change',
                                  'infected_mean', 'noninfected_mean',
                                  'gene_indices', 'gene_names'])
-                            for code, r in sig_codes:
-                                genes = set()
-                                for key in (set(sub.keys) &
-                                            set(mappings['vq_to_gene'].keys())):
-                                    genes.update(
-                                        mappings['vq_to_gene'][key].get(code, []))
-                                gene_idx_list = sorted(genes)
+                            for code, r, gene_idx_list in sig_codes:
                                 gene_names_list = []
                                 if mappings.get('gene_names'):
                                     for g in gene_idx_list:
@@ -1961,8 +2204,8 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                                     ';'.join(gene_names_list),
                                 ])
                         n_sig = len(sig_codes)
-                        print(f"    Exported {n_sig} significant codes "
-                              f"(p<0.05) to infection_genes_for_go.csv")
+                        print(f"    Exported {n_sig} codes with genes to "
+                              f"infection_genes_for_go.csv")
 
             # -- Sex code enrichment (sex_year_lake only) --
             if strat == 'sex_year_lake':
@@ -1977,13 +2220,21 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                     plt.close(fig)
                     print("    Saved sex_code_enrichment.png")
 
-                    # Export gene lists for GO analysis (raw p<0.05 — see
-                    # infection-code comment above for rationale).
-                    sig_sex = [(code, r) for code, r in sex_enrich.items()
-                               if r.get('p_value', 1.0) < 0.05]
+                    # Export gene lists for ALL codes that have genes (not just
+                    # p<0.05) — see infection-code comment above.
+                    sig_sex = []
+                    if mappings:
+                        for code, r in sex_enrich.items():
+                            genes = set()
+                            for key in (set(sub.keys) &
+                                        set(mappings['vq_to_gene'].keys())):
+                                genes.update(
+                                    mappings['vq_to_gene'][key].get(code, []))
+                            if genes:
+                                sig_sex.append((code, r, sorted(genes)))
                     sig_sex.sort(key=lambda x: x[1].get('q_value',
                                                         x[1]['p_value']))
-                    if sig_sex and mappings:
+                    if sig_sex:
                         go_path = os.path.join(
                             figures_dir, 'sex_genes_for_go.csv')
                         import csv as _csv
@@ -1993,13 +2244,7 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                                 ['vq_code', 'p_value', 'q_value', 'fold_change',
                                  'male_mean', 'female_mean',
                                  'gene_indices', 'gene_names'])
-                            for code, r in sig_sex:
-                                genes = set()
-                                for key in (set(sub.keys) &
-                                            set(mappings['vq_to_gene'].keys())):
-                                    genes.update(
-                                        mappings['vq_to_gene'][key].get(code, []))
-                                gene_idx_list = sorted(genes)
+                            for code, r, gene_idx_list in sig_sex:
                                 gene_names_list = []
                                 if mappings.get('gene_names'):
                                     for g in gene_idx_list:
@@ -2015,8 +2260,8 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                                     ';'.join(str(g) for g in gene_idx_list),
                                     ';'.join(gene_names_list),
                                 ])
-                        print(f"    Exported {len(sig_sex)} significant codes "
-                              f"(p<0.05) to sex_genes_for_go.csv")
+                        print(f"    Exported {len(sig_sex)} codes with genes to "
+                              f"sex_genes_for_go.csv")
 
             # -- Role (Source/Recipient) code enrichment (year_lake only) --
             if strat == 'year_lake':
@@ -2031,13 +2276,21 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                     plt.close(fig)
                     print("    Saved role_code_enrichment.png")
 
-                    # Export gene lists for GO analysis (raw p<0.05 — see
-                    # infection-code comment above for rationale).
-                    sig_role = [(code, r) for code, r in role_enrich.items()
-                                if r.get('p_value', 1.0) < 0.05]
+                    # Export gene lists for ALL codes that have genes (not just
+                    # p<0.05) — see infection-code comment above.
+                    sig_role = []
+                    if mappings:
+                        for code, r in role_enrich.items():
+                            genes = set()
+                            for key in (set(sub.keys) &
+                                        set(mappings['vq_to_gene'].keys())):
+                                genes.update(
+                                    mappings['vq_to_gene'][key].get(code, []))
+                            if genes:
+                                sig_role.append((code, r, sorted(genes)))
                     sig_role.sort(key=lambda x: x[1].get('q_value',
                                                          x[1]['p_value']))
-                    if sig_role and mappings:
+                    if sig_role:
                         go_path = os.path.join(
                             figures_dir, 'role_genes_for_go.csv')
                         import csv as _csv
@@ -2047,13 +2300,7 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                                 ['vq_code', 'p_value', 'q_value', 'fold_change',
                                  'source_mean', 'recipient_mean',
                                  'gene_indices', 'gene_names'])
-                            for code, r in sig_role:
-                                genes = set()
-                                for key in (set(sub.keys) &
-                                            set(mappings['vq_to_gene'].keys())):
-                                    genes.update(
-                                        mappings['vq_to_gene'][key].get(code, []))
-                                gene_idx_list = sorted(genes)
+                            for code, r, gene_idx_list in sig_role:
                                 gene_names_list = []
                                 if mappings.get('gene_names'):
                                     for g in gene_idx_list:
@@ -2069,14 +2316,14 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                                     ';'.join(str(g) for g in gene_idx_list),
                                     ';'.join(gene_names_list),
                                 ])
-                        print(f"    Exported {len(sig_role)} significant codes "
-                              f"(p<0.05) to role_genes_for_go.csv")
+                        print(f"    Exported {len(sig_role)} codes with genes to "
+                              f"role_genes_for_go.csv")
 
     # ---- PERMANOVA: variance decomposition on VQ embeddings ----
     # Runs three decompositions per stratification:
     #   all lakes, source lakes only, recipient lakes only.
-    # Factors include lake_category (Source/Recipient), ecotype, ancestry
-    # (GenotypePool), match status, lake, year, sex, infection.
+    # Factors: lake_category (Source/Recipient), ecotype (== ancestry/GenotypePool,
+    # kept once to avoid collinearity), lake habitat, lake, year, sex, infection.
     print("\nPERMANOVA variance decomposition...")
     permanova_path = os.path.join(args.output_dir,
                                    _joint_path(args, 'permanova.pkl'))
@@ -2110,10 +2357,6 @@ def step_generate_figures(args, embeddings, sd, mappings, slopes, clustering,
                     'Ecotype': str(sd_obj.get_lake_ecotype(lake)),
                     'Lake Habitat': str(sd_obj.get_lake_habitat(lake)),
                 }
-                # Ancestry (GenotypePool) — meaningful for recipient lakes
-                anc = sd_obj.get_genotype(lake)
-                if anc and anc != 'nan':
-                    meta['Ancestry'] = anc
                 # Sex suffix
                 if s.endswith('-f'):
                     meta['Sex'] = 'Female'
@@ -2414,10 +2657,12 @@ def main():
                              'train_meta.pkl and the best_epoch fallback is wrong.')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate')
-    parser.add_argument('--commit-alpha', type=float, default=0.25,
+    parser.add_argument('--commit-alpha', type=float, default=0.5,
                         help='VQ commitment loss weight')
-    parser.add_argument('--noise-scale', type=float, default=5.0,
-                        help='Multiplier for radii (0 disables noise)')
+    parser.add_argument('--noise-scale', type=float, default=0.5,
+                        help='Multiplier for radii (0 disables noise). '
+                             'Training-only data augmentation (eval is '
+                             'deterministic).')
     parser.add_argument('--codebook-size', type=int, default=100,
                         help='Number of VQ codes in the codebook')
 
@@ -2479,11 +2724,19 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Reproducibility: seed both numpy (train_joint's per-epoch lake shuffle,
+    # and any global-RNG use) and torch (model parameter initialization) so
+    # identical flags produce identical models.  The batched path additionally
+    # derives per-epoch permutations from default_rng(seed + epoch).
+    import torch as _torch
+    np.random.seed(args.seed)
+    _torch.manual_seed(args.seed)
+
     # Configuration derived from data — n_genes is set automatically
     cfg = {
         'stratifications': ['year_lake', 'sex_year_lake', 'infection_year_lake'],
         'n_eigencomponents': 17,
-        'reconstruction_levels': [2, 4, 16],
+        'reconstruction_levels': [2, 4, 8, 16],
         'in_channels': 64,
         'hidden_channels': 64,
         'out_channels': 8,
@@ -2498,6 +2751,16 @@ def main():
 
     if args.graphs_dir:
         # --- Skip Steps 0-2: load pre-built artefacts ---
+        if args.top_n_genes is not None or args.min_expression > 0:
+            # In the two-phase Modal flow, cpu_steps already applied the filter
+            # and persisted the FILTERED matrices + graphs in graphs_dir, so the
+            # flags here are redundant, not contradictory.  Refusing would break
+            # train_steps, which legitimately forwards them.  Note it loudly and
+            # proceed with the pre-built (already-filtered) artefacts.
+            print(f"[Skip 0-2] NOTE: --top-n-genes/--min-expression are "
+                  f"ignored in --graphs-dir mode — the pre-built graphs and "
+                  f"matrices already reflect them (cpu_steps applied the "
+                  f"filter before graph construction).")
         print(f"[Skip 0-2] Loading pre-built graphs from {args.graphs_dir}")
         matrices = load_pickle(
             os.path.join(args.graphs_dir, 'matrices.pkl'))
@@ -2548,89 +2811,35 @@ def main():
                 sys.exit(1)
             args.transcriptome = step_batch_correct(args)
 
-        # --- Steps 1-2: Data → Graphs ---
+        # --- Step 1: Data ---
         matrices, sd = step_load_data(args, cfg)
         cfg['n_genes'] = sd.n_genes
+
+        # --- Optional: two-stage gene filtering ---
+        # MUST run BEFORE graph construction so the graphs and the model share
+        # the same gene set (see _apply_gene_filter docstring).
+        matrices, sd = _apply_gene_filter(args, cfg, matrices, sd)
+
+        # Persist the (possibly filtered) matrices/data so every downstream
+        # consumer — including the WGCNA baseline, which must run on EXACTLY
+        # the model gene set — sees matrices whose columns are aligned to
+        # sd.gene_names / gene_mappings['gene_names'].
+        _matrices_path = checkpoint_path(args.output_dir, 'matrices.pkl')
+        _data_path = checkpoint_path(args.output_dir, 'data.pkl')
+        if exists(_matrices_path):
+            try:
+                _prev = load_pickle(_matrices_path)
+                _meta = (_prev.get('__meta__', {})
+                         if isinstance(_prev, dict) else {})
+            except Exception:
+                _meta = {}
+            save_pickle({**matrices, '__meta__': _meta}, _matrices_path)
+            save_pickle(sd, _data_path)
+            print(f"  Re-saved {len(matrices)} matrices aligned to the model "
+                  f"gene set ({cfg['n_genes']} genes).")
+
+        # --- Step 2: Graphs ---
         graphs, radii = step_build_graphs(args, cfg, matrices)
-
-    # --- Optional: two-stage gene filtering ---
-    # Stage 1: remove lowly-expressed genes (technical noise)
-    # Stage 2: keep top N by variance (biologically informative fraction)
-    do_expression_filter = args.min_expression > 0
-    do_variance_filter = (
-        args.top_n_genes is not None and args.top_n_genes < cfg['n_genes']
-    )
-
-    if do_expression_filter or do_variance_filter:
-        # Pool expression data across all matrices for gene-level statistics
-        all_expr = []
-        for M in matrices.values():
-            if hasattr(M, 'shape') and M.shape[0] > 0:
-                all_expr.append(np.asarray(M, dtype=np.float64))
-        pooled = np.vstack(all_expr) if all_expr else None
-
-        if pooled is None:
-            print("  WARNING: No expression data to filter — skipping")
-        else:
-            n_original = pooled.shape[1]
-            gene_means = np.mean(pooled, axis=0)
-            gene_vars = np.var(pooled, axis=0)
-            keep_mask = np.ones(n_original, dtype=bool)
-
-            # --- Stage 1: expression filter ---
-            if do_expression_filter:
-                expr_keep = gene_means >= args.min_expression
-                n_removed = int((~expr_keep).sum())
-                keep_mask &= expr_keep
-                print(f"\n  Stage 1 (expression filter): removed {n_removed} "
-                      f"genes with mean < {args.min_expression:.2e} "
-                      f"({100*n_removed/n_original:.1f}%)")
-                print(f"    Surviving: {int(keep_mask.sum())} genes "
-                      f"(mean range: {gene_means[keep_mask].min():.2e} – "
-                      f"{gene_means[keep_mask].max():.2e})")
-
-            # --- Stage 2: variance filter ---
-            if do_variance_filter:
-                surviving_idx = np.where(keep_mask)[0]
-                n_surviving = len(surviving_idx)
-                if args.top_n_genes >= n_surviving:
-                    print(f"  Stage 2 (variance filter): --top-n-genes "
-                          f"({args.top_n_genes}) >= surviving genes "
-                          f"({n_surviving}) — keeping all")
-                else:
-                    # Rank surviving genes by variance (descending)
-                    surv_vars = gene_vars[surviving_idx]
-                    var_order = np.argsort(surv_vars)[::-1]
-                    top_surviving = surviving_idx[var_order[:args.top_n_genes]]
-                    new_mask = np.zeros(n_original, dtype=bool)
-                    new_mask[top_surviving] = True
-                    keep_mask = new_mask
-                    print(f"  Stage 2 (variance filter): kept top "
-                          f"{args.top_n_genes} genes by variance "
-                          f"(variance range: "
-                          f"{gene_vars[keep_mask].min():.2e} – "
-                          f"{gene_vars[keep_mask].max():.2e})")
-
-            # --- Apply mask to all matrices ---
-            final_idx = np.where(keep_mask)[0]
-            final_idx = np.sort(final_idx)
-            print(f"  Final gene set: {len(final_idx)}/{n_original} "
-                  f"({100*len(final_idx)/n_original:.1f}%)")
-
-            for key in tqdm(list(matrices.keys()), desc="  Subsetting matrices"):
-                M = np.asarray(matrices[key])
-                matrices[key] = M[:, final_idx]
-
-            if sd is not None:
-                sd.gene_names = [sd.gene_names[i] for i in final_idx]
-                sd.n_genes = len(final_idx)
-            cfg['n_genes'] = len(final_idx)
-
-            if args.graphs_dir:
-                print("  WARNING: --graphs-dir graphs were built with full "
-                      "gene set. Gene filtering with pre-built graphs "
-                      "will cause dimension mismatch. "
-                      "Rebuild graphs without --graphs-dir.")
 
     if args.stop_after is not None and args.stop_after <= 2:
         elapsed = time.time() - t0
@@ -2673,8 +2882,9 @@ def main():
                 clustering = step_hierarchical_clustering(args, embeddings, sd)
                 label_perm = step_label_permutation(args, embeddings, sd)
                 step_generate_figures(
-                    args, embeddings, sd, mappings, slopes, clustering,
-                    label_perm, model=model,
+                    args, embeddings, sd, mappings,
+                    # slopes, clustering, label_perm,  # unused (dead-code audit)
+                    model=model,
                 )
         else:
             # --- Original: pre-load all graphs, then train sequentially ---
@@ -2707,13 +2917,32 @@ def main():
                 clustering = step_hierarchical_clustering(args, embeddings, sd)
                 label_perm = step_label_permutation(args, embeddings, sd)
                 step_generate_figures(
-                    args, embeddings, sd, mappings, slopes, clustering,
-                    label_perm, model=model,
+                    args, embeddings, sd, mappings,
+                    # slopes, clustering, label_perm,  # unused (dead-code audit)
+                    model=model,
                 )
 
     else:
         # --- Step 3: Model training (single paradigm) ---
-        model = step_train_model(args, cfg, graphs, radii)
+        if args.graph_batch_size > 0:
+            # Batched loading with the same prefetch worker as train-both —
+            # bounds CPU RAM for the all-genes regime where loading every
+            # graph bundle at once OOMs.  train_joint=False → sequential-only.
+            lake_names = sorted(set(
+                str(k).split(' (')[0] for k in graphs.keys()))
+            lake_name_to_id = {name: i for i, name in enumerate(lake_names)}
+            n_lakes = len(lake_names)
+            all_keys = sorted(graphs.keys())
+            seq_model, joint_model = _train_models_batched(
+                args, cfg, graphs, radii,
+                lake_name_to_id if args.train_joint else None,
+                n_lakes if args.train_joint else None,
+                all_keys, args.graph_batch_size,
+                train_joint=args.train_joint,
+            )
+            model = joint_model if args.train_joint else seq_model
+        else:
+            model = step_train_model(args, cfg, graphs, radii)
 
         if args.stop_after is not None and args.stop_after <= 3:
             elapsed = time.time() - t0
@@ -2752,8 +2981,9 @@ def main():
 
         # --- Step 9: Generate figures ---
         step_generate_figures(
-            args, embeddings, sd, mappings, slopes, clustering,
-            label_perm, model=model,
+            args, embeddings, sd, mappings,
+            # slopes, clustering, label_perm,  # unused (dead-code audit)
+            model=model,
         )
 
         if args.stop_after is not None and args.stop_after <= 9:

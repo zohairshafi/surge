@@ -1,5 +1,5 @@
 # Manuscript (not committed)
-manuscript.tex
+manuscript*.tex
 
 # Python
 __pycache__/

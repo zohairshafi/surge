@@ -207,16 +207,33 @@ class SticklebackData:
             raw = dict(zip(self.infection['Fish_ID'],
                            self.infection['Fibrosis_score_0_1_2_3_4']))
             n_inf = 0
+            n_noninf = 0
+            n_unscored = 0
             for f, score in raw.items():
+                # Fish without a recorded fibrosis score (NaN) carry no
+                # infection measurement — classifying them as either infected
+                # or non-infected would fabricate a label.  They stay in
+                # lake/year/sex strata but are excluded from BOTH infection
+                # strata (fish_to_infection[f] = None matches neither 0 nor 1
+                # in _fish_subset).
+                if pd.isna(score) or (
+                        isinstance(score, str) and not score.strip()):
+                    self.fish_to_infection[f] = None
+                    n_unscored += 1
+                    continue
                 s = int(score)
                 if s < 0:
                     raise ValueError(f"[data] Negative fibrosis score {s} for "
                                      f"fish {f}")
                 self.fish_to_infection[f] = 1 if s >= 1 else 0
-                n_inf += 1 if s >= 1 else 0
+                if s >= 1:
+                    n_inf += 1
+                else:
+                    n_noninf += 1
             print(f"[data] Infection binarized: {n_inf} infected "
-                  f"(fibrosis >= 1), {len(raw) - n_inf} non-infected "
-                  f"(fibrosis == 0).")
+                  f"(fibrosis >= 1), {n_noninf} non-infected "
+                  f"(fibrosis == 0), {n_unscored} unscored "
+                  f"(excluded from infection strata).")
 
     # ------------------------------------------------------------------
     # Classification helpers
@@ -270,57 +287,65 @@ class SticklebackData:
         entry = self._normalize_lake(lake, self.lake_to_genotype)
         return entry if entry else 'nan'
 
-    def get_transplant_match(self, lake):
-        """Classify a lake by transplant match status.
+# DEAD CODE (commented out): SticklebackData.get_transplant_match (never called)
+#    def get_transplant_match(self, lake):
+#        """Classify a lake by transplant match status.
 
-        Returns
-        -------
-        str
-            ``'source'`` — natural population, no transplant.
-            ``'matched'`` — recipient lake where fish ancestry matches habitat.
-            ``'mismatched'`` — recipient lake where ancestry ≠ habitat.
-            ``'mixed'`` — MixedPool ancestry or mixed-ecotype habitat.
-            ``'other'`` — neither Source nor Recipient (e.g. Jean Lake).
-        """
-        role = self.get_lake_role(lake)
-        if role == 'Source':
-            return 'source'
+#        Returns
+#        -------
+#        str
+#            ``'source'`` — natural population, no transplant.
+#            ``'matched'`` — recipient lake where fish ancestry matches habitat.
+#            ``'mismatched'`` — recipient lake where ancestry ≠ habitat.
+#            ``'mixed'`` — MixedPool ancestry or mixed-ecotype habitat.
+#            ``'other'`` — neither Source nor Recipient (e.g. Jean Lake).
+#        """
+#        role = self.get_lake_role(lake)
+#        if role == 'Source':
+#            return 'source'
 
-        genotype = self.get_genotype(lake)
+#        genotype = self.get_genotype(lake)
         # Compare ancestry against the lake's PHYSICAL HABITAT, not its
         # ecotype: the ecotype field is itself ancestry, so comparing
         # genotype→ecotype measured ancestry-vs-ancestry and could never
         # classify a lake as 'mismatched' (e.g. Fred/Ranchero are Limnetic-
         # ancestry but Benthic-habitat).
-        hab = self.get_lake_habitat(lake)
+#        hab = self.get_lake_habitat(lake)
 
         # Non-Source lakes without genotype data → 'other'
-        if genotype == 'nan' or hab == 'Unknown':
-            return 'other'
+#        if genotype == 'nan' or hab == 'Unknown':
+#            return 'other'
 
         # Mixed ancestry or mixed habitat → 'mixed'
-        is_mixed_hab = ('Benthic' in hab and 'Limnetic' in hab)
-        if genotype == 'MixedPool' or is_mixed_hab:
-            return 'mixed'
+#        is_mixed_hab = ('Benthic' in hab and 'Limnetic' in hab)
+#        if genotype == 'MixedPool' or is_mixed_hab:
+#            return 'mixed'
 
         # Map genotype pool to expected ecotype for matched/mismatched
-        genotype_eco = {
-            'BenthicPool': 'Benthic',
-            'LimneticPool': 'Limnetic',
-        }.get(genotype)
+#        genotype_eco = {
+#            'BenthicPool': 'Benthic',
+#            'LimneticPool': 'Limnetic',
+#        }.get(genotype)
 
-        if genotype_eco is None:
-            return 'other'
+#        if genotype_eco is None:
+#            return 'other'
 
-        return 'matched' if genotype_eco == hab else 'mismatched'
+#        return 'matched' if genotype_eco == hab else 'mismatched'
 
     def get_genotype_color(self, lake):
         """Return color for the lake's genotype pool."""
         return self.GENOTYPE_COLORS.get(str(self.get_genotype(lake)), '#000000')
 
     def get_lake_color(self, lake):
-        """Return assigned color for a given lake."""
-        return self.LAKE_COLORS.get(lake, '#000000')
+        """Return assigned color for a given lake.
+
+        Uses the same name normalization as the other getters so a lake
+        referenced as 'Crystal Lake' (with suffix) resolves to the color
+        keyed under 'Crystal' (and vice versa) instead of silently falling
+        back to black.
+        """
+        color = self._normalize_lake(lake, self.LAKE_COLORS)
+        return color if color else '#000000'
 
     # ------------------------------------------------------------------
     # Expression matrix extraction

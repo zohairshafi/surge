@@ -423,6 +423,51 @@ def batch_correct_hk(metadata_path, transcriptome_path,
     if merged.shape[0] == 0:
         raise RuntimeError("No samples matched between metadata and transcriptome — check Fish_ID values")
 
+    # ---- Duplicate Fish_ID guard ----
+    # A fish appearing more than once (from duplicate rows in the metadata,
+    # the morphology file, or the transcriptome — the morphology left-merge
+    # above explodes a fish into N rows when the sex file lists it N times)
+    # would silently double-count that fish in its lake's expression matrix
+    # AND produce a pipeline CSV that SticklebackData correctly rejects.
+    #   - IDENTICAL duplicate rows  → deduplicate (genuine data-entry dup).
+    #   - CONFLICTING duplicate rows (differing values, e.g. the fish is in
+    #     both the source and recipient cohorts) → neither copy can be
+    #     trusted, so EXCLUDE ALL copies loudly.  (User-approved handling.)
+    if merged['Fish_ID'].duplicated().any():
+        dup_ids = sorted(
+            set(merged.loc[merged['Fish_ID'].duplicated(keep=False),
+                           'Fish_ID']))
+        # Diagnose where the duplicates originate so the source can be fixed.
+        sources = []
+        if meta['Fish_ID'].duplicated().any():
+            sources.append('metadata')
+        if morphology_path is not None and os.path.exists(morphology_path):
+            if morph['Fish_ID'].duplicated().any():
+                sources.append('morphology')
+        if rna_raw['Fish_ID'].duplicated().any():
+            sources.append('transcriptome')
+        if not sources:
+            sources.append('merge')
+        identical, conflicting = [], []
+        for fid in dup_ids:
+            rows = merged[merged['Fish_ID'] == fid]
+            (conflicting if rows.drop_duplicates().shape[0] > 1
+             else identical).append(fid)
+        if conflicting:
+            print(f"[batch_correct] EXCLUDING {len(conflicting)} fish with "
+                  f"conflicting duplicate rows (source: "
+                  f"{', '.join(sources)}): {conflicting} — assigned to both "
+                  f"source and recipient cohorts / differing values; dropping "
+                  f"ALL copies.")
+            merged = merged[~merged['Fish_ID'].isin(conflicting)]
+        if identical:
+            n_drop = int(merged[merged['Fish_ID'].isin(identical)]
+                         ['Fish_ID'].duplicated().sum())
+            print(f"[batch_correct] Removing {n_drop} IDENTICAL duplicate "
+                  f"row(s) for {len(identical)} fish (source: "
+                  f"{', '.join(sources)}): {identical}")
+            merged = merged.drop_duplicates(subset=['Fish_ID'], keep='first')
+
     # Split expression columns from metadata columns
     meta_cols = list(meta.columns)
     expr_cols = [c for c in merged.columns if c not in meta_cols]
